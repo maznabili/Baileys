@@ -7,7 +7,7 @@ const Utils = require('./WhatsAppWeb.Utils')
 module.exports = {
 	/**
 	 * Connect to WhatsAppWeb
-	 * @param {object} [authInfo] credentials to log back in
+	 * @param {Object} [authInfo] credentials to log back in
 	 * @param {number} [timeoutMs] timeout after which the connect will fail, set to null for an infinite timeout
 	 * @return {promise<[object, any[], any[], any[]]>} returns [userMetaData, chats, contacts, unreadMessages]
 	 */
@@ -24,7 +24,7 @@ module.exports = {
         }
 		this.conn = new WebSocket("wss://web.whatsapp.com/ws", {origin: "https://web.whatsapp.com"})
 
-		const promise = new Promise ( (resolve, reject) => {
+		let promise = new Promise ( (resolve, reject) => {
 			this.conn.on('open', () => {
 				this.conn.on('message', (m) => this.onMessageRecieved(m)) // in WhatsAppWeb.Recv.js	
 				this.beginAuthentication ().then (resolve).catch (reject)
@@ -34,15 +34,11 @@ module.exports = {
 				reject (error)	
 			})
 		})
-		if (timeoutMs) {
-			return Utils.promiseTimeout (timeoutMs, promise)
-			.catch (error => {
-				this.close()
-				throw error
-			})
-		} else {
-			return promise
-		}
+		promise = timeoutMs ? Utils.promiseTimeout (timeoutMs, promise) : promise
+		return promise.catch (err => {
+			this.close ()
+			throw err
+		})
 	},
 	/** once a connection has been successfully established
 	 * @private
@@ -107,17 +103,18 @@ module.exports = {
 		}) // validate the connection
 		.then (() => {
 			this.log ("waiting for chats & contacts") // wait for the message with chats
-
-			const waitForConvos = new Promise ((resolve, _) => {
+			const waitForConvos = () => new Promise ((resolve, _) => {
 				const chatUpdate = (json) => {
 					const isLast = json[1].last
 					json = json[2]
-					for (var k = json.length-1;k >= 0;k--) { 
-						const message = json[k][2]
-						const jid = message.key.remoteJid.replace ("@s.whatsapp.net", "@c.us")
-						if (!message.key.fromMe && unreadMap[jid] > 0) { // only forward if the message is from the sender
-							unreadMessages.push (message)
-							unreadMap[jid] -= 1 // reduce
+					if (json) {
+						for (var k = json.length-1;k >= 0;k--) { 
+							const message = json[k][2]
+							const jid = message.key.remoteJid.replace ("@s.whatsapp.net", "@c.us")
+							if (!message.key.fromMe && unreadMap[jid] > 0) { // only forward if the message is from the sender
+								unreadMessages.push (message)
+								unreadMap[jid] -= 1 // reduce
+							}
 						}
 					}
 					if (isLast) {
@@ -136,21 +133,20 @@ module.exports = {
 			const waitForChats = this.registerCallbackOneTime (["response",  "type:chat"]).then (json => {
 				chats = json[2] // chats data (log json to see what it looks like)
 				chats.forEach (chat => unreadMap [chat[1].jid] = chat[1].count) // store the number of unread messages for each sender
+				if (chats && chats.length > 0) {
+					return waitForConvos ()
+				}
 			})
 			const waitForContacts = this.registerCallbackOneTime (["response", "type:contacts"])
 									.then (json => contacts = json[2])
 			// wait for the chats & contacts to load
-			return Promise.all ([waitForConvos, waitForChats, waitForContacts])
+			return Promise.all ([waitForChats, waitForContacts])
 		})
 		.then (() => {
 			// now we're successfully connected
 			this.log("connected successfully")
 			// resolve the promise
 			return [this.userMetaData, chats, contacts, unreadMessages]
-		})
-		.catch (err => {
-			this.close ()
-			throw err
 		})
 	},
 	/**
