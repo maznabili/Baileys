@@ -101,13 +101,15 @@ conn.connectOptions = {
      */
     waitOnlyForLastMessage?: false
     /** max time for the phone to respond to a connectivity test */
-    phoneResponseTime?: 7500
+    phoneResponseTime?: 10_000
     /** minimum time between new connections */
     connectCooldownMs?: 3000
     /** agent used for WS connections (could be a proxy agent) */
     agent?: Agent = undefined
     /** agent used for fetch requests -- uploading/downloading media */
     fetchAgent?: Agent = undefined
+    /** always uses takeover for connecting */
+    alwaysUseTakeover: true
 } as WAConnectOptions
 ```
 
@@ -478,13 +480,13 @@ Baileys is written, keeping in mind, that you may require other custom functiona
 
 First, enable the logging of unhandled messages from WhatsApp by setting
 ``` ts
-conn.logLevel = MessageLogLevel.unhandled // set to MessageLogLevel.all to see all messages received
+conn.logger.level = 'unhandled'
 ```
 This will enable you to see all sorts of messages WhatsApp sends in the console. Some examples:
 
 1. Functionality to track of the battery percentage of your phone.
     You enable logging and you'll see a message about your battery pop up in the console: 
-    ``` [Baileys] [Unhandled] s22, ["action",null,[["battery",{"live":"false","value":"52"},null]]] ``` 
+    ```s22, ["action",null,[["battery",{"live":"false","value":"52"},null]]] ``` 
     
     You now know what a battery update looks like. It'll have the following characteristics.
     - Given ```const bMessage = ["action",null,[["battery",{"live":"false","value":"52"},null]]]```
@@ -504,7 +506,7 @@ This will enable you to see all sorts of messages WhatsApp sends in the console.
     ``` message [0] === "action" && message [1] === null && message[2][0][0] === "battery" ```
 2. Functionality to keep track of the pushname changes on your phone.
     You enable logging and you'll see an unhandled message about your pushanme pop up like this: 
-    ```[Baileys] [Unhandled] s24, ["Conn",{"pushname":"adiwajshing"}]``` 
+    ```s24, ["Conn",{"pushname":"adiwajshing"}]``` 
     
     You now know what a pushname update looks like. It'll have the following characteristics.
     - Given ```const pMessage = ["Conn",{"pushname":"adiwajshing"}] ```

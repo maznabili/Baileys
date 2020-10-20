@@ -1,5 +1,5 @@
 import * as Utils from './Utils'
-import { WAMessage, WAChat, MessageLogLevel, WANode, KEEP_ALIVE_INTERVAL_MS, BaileysError, WAConnectOptions, DisconnectReason, UNAUTHORIZED_CODES, WAContact, TimedOutError, CancelledError, WAOpenResult, DEFAULT_ORIGIN, WS_URL } from './Constants'
+import { WAMessage, WAChat, WANode, KEEP_ALIVE_INTERVAL_MS, BaileysError, WAConnectOptions, DisconnectReason, UNAUTHORIZED_CODES, WAContact, TimedOutError, CancelledError, WAOpenResult, DEFAULT_ORIGIN, WS_URL } from './Constants'
 import {WAConnection as Base} from './1.Validation'
 import Decoder from '../Binary/Decoder'
 import WS from 'ws'
@@ -34,10 +34,10 @@ export class WAConnection extends Base {
                 lastConnect = new Date()
 
                 const loggedOut = error instanceof BaileysError && UNAUTHORIZED_CODES.includes(error.status)
-                const willReconnect = !loggedOut && (tries <= (options?.maxRetries || 5)) && this.state === 'connecting'
+                const willReconnect = !loggedOut && (tries < options?.maxRetries) && (this.state === 'connecting')
                 const reason = loggedOut ? DisconnectReason.invalidSession : error.message
 
-                this.log (`connect attempt ${tries} failed: ${error}${ willReconnect ? ', retrying...' : ''}`, MessageLogLevel.info)
+                this.logger.warn ({ error }, `connect attempt ${tries} failed${ willReconnect ? ', retrying...' : ''}`)
 
                 if ((this.state as string) !== 'close' && !willReconnect) {
                     this.closeInternal (reason)
@@ -53,7 +53,7 @@ export class WAConnection extends Base {
  
         this.releasePendingRequests ()
         
-        this.log ('opened connection to WhatsApp Web', MessageLogLevel.info)
+        this.logger.info ('opened connection to WhatsApp Web')
 
         this.conn.on ('close', () => this.unexpectedDisconnect (DisconnectReason.close))
 
@@ -66,11 +66,6 @@ export class WAConnection extends Base {
             let cancel: () => void
             const task = new Promise((resolve, reject) => {
                 cancel = () => reject (CancelledError())
-                // determine whether reconnect should be used or not
-                const shouldUseReconnect = this.lastDisconnectReason !== DisconnectReason.replaced && 
-                                            this.lastDisconnectReason !== DisconnectReason.unknown &&
-                                            this.lastDisconnectReason !== DisconnectReason.intentional && 
-                                            this.user?.jid
                 
                 const checkIdleTime = () => {
                     this.debounceTimeout && clearTimeout (this.debounceTimeout)
@@ -81,8 +76,11 @@ export class WAConnection extends Base {
                     clearTimeout (this.debounceTimeout)
                     this.conn.removeEventListener ('message', checkIdleTime)
                 }
-
-                const reconnectID = shouldUseReconnect ? this.user.jid.replace ('@s.whatsapp.net', '@c.us') : null
+                // determine whether reconnect should be used or not
+                const shouldUseReconnect = (this.lastDisconnectReason === DisconnectReason.close || 
+                                            this.lastDisconnectReason === DisconnectReason.lost) &&
+                                            !this.connectOptions.alwaysUseTakeover
+                const reconnectID = shouldUseReconnect && this.user.jid.replace ('@s.whatsapp.net', '@c.us')
 
                 this.conn = new WS(WS_URL, null, { 
                     origin: DEFAULT_ORIGIN, 
@@ -100,7 +98,7 @@ export class WAConnection extends Base {
                 this.conn.addEventListener('message', ({data}) => this.onMessageRecieved(data as any))
                 
                 this.conn.on ('open', async () => {
-                    this.log(`connected to WhatsApp Web server, authenticating via ${reconnectID ? 'reconnect' : 'takeover'}`, MessageLogLevel.info)
+                    this.logger.info(`connected to WhatsApp Web server, authenticating via ${reconnectID ? 'reconnect' : 'takeover'}`)
                     let waitForChats: Promise<{[k: string]: Partial<WAChat>}>
                     // add wait for chats promise if required
                     if (typeof options?.waitForChats === 'undefined' ? true : options?.waitForChats) {
@@ -228,7 +226,7 @@ export class WAConnection extends Base {
             json[2]
             .forEach(([item, chat]: [any, WAChat]) => {
                 if (!chat) {
-                    this.log (`unexpectedly got null chat: ${item}, ${chat}`, MessageLogLevel.info)
+                    this.logger.warn (`unexpectedly got null chat: ${item}`, chat)
                     return
                 }
 
@@ -241,7 +239,7 @@ export class WAConnection extends Base {
                 !chats.get (chat.jid) && chats.insert (chat) 
             })
             
-            this.log (`received ${json[2].length} chats`, MessageLogLevel.info)
+            this.logger.info (`received ${json[2].length} chats`)
             if (json[2].length === 0) {
                 receivedMessages = true
                 checkForResolution ()
@@ -254,12 +252,12 @@ export class WAConnection extends Base {
             receivedContacts = true
             
             json[2].forEach(([type, contact]: ['user', WAContact]) => {
-                if (!contact) return this.log (`unexpectedly got null contact: ${type}, ${contact}`, MessageLogLevel.info)
+                if (!contact) return this.logger.info (`unexpectedly got null contact: ${type}`, contact)
                 
                 contact.jid = Utils.whatsappID (contact.jid)
                 contacts[contact.jid] = contact
             })
-            this.log (`received ${json[2].length} contacts`, MessageLogLevel.info)
+            this.logger.info (`received ${json[2].length} contacts`)
             checkForResolution ()
         })
 
@@ -310,64 +308,74 @@ export class WAConnection extends Base {
             this.lastSeen = new Date(parseInt(timestamp))
             this.emit ('received-pong')
         } else {
-            const [messageTag, json] = Utils.decryptWA (message, this.authInfo?.macKey, this.authInfo?.encKey, new Decoder())
-            if (this.shouldLogMessages) this.messageLog.push ({ tag: messageTag, json: JSON.stringify(json), fromMe: false })
-            
-            if (!json) {return}
+            try {
+                const [messageTag, json] = Utils.decryptWA (message, this.authInfo?.macKey, this.authInfo?.encKey, new Decoder())
+                if (this.shouldLogMessages) this.messageLog.push ({ tag: messageTag, json: JSON.stringify(json), fromMe: false })
+                
+                if (!json) { return }
 
-            if (this.logLevel === MessageLogLevel.all) {
-                this.log(messageTag + ', ' + JSON.stringify(json), MessageLogLevel.all)
-            }
-            if (!this.phoneConnected && this.state === 'open') {
-                this.phoneConnected = true
-                this.emit ('connection-phone-change', { connected: true })
-            }
-            /*
-             Check if this is a response to a message we sent
-            */
-            if (this.callbacks[messageTag]) {
-                const q = this.callbacks[messageTag]
-                q.callback(json)
-                delete this.callbacks[messageTag]
-                return
-            }
-            /*
-             Check if this is a response to a message we are expecting
-            */
-            if (this.callbacks['function:' + json[0]]) {
-                const callbacks = this.callbacks['function:' + json[0]]
-                let callbacks2
-                let callback
-                for (const key in json[1] || {}) {
-                    callbacks2 = callbacks[key + ':' + json[1][key]]
-                    if (callbacks2) {
-                        break
-                    }
+                if (this.logger.level === 'trace') {
+                    this.logger.trace(messageTag + ', ' + JSON.stringify(json))
                 }
-                if (!callbacks2) {
+                /*
+                Check if this is a response to a message we sent
+                */
+                if (this.callbacks[messageTag]) {
+                    const q = this.callbacks[messageTag]
+                    q.callback(json)
+                    delete this.callbacks[messageTag]
+                    return
+                }
+                /*
+                Check if this is a response to a message we are expecting
+                */
+                if (this.callbacks['function:' + json[0]]) {
+                    const callbacks = this.callbacks['function:' + json[0]]
+                    let callbacks2
+                    let callback
                     for (const key in json[1] || {}) {
-                        callbacks2 = callbacks[key]
+                        callbacks2 = callbacks[key + ':' + json[1][key]]
                         if (callbacks2) {
                             break
                         }
                     }
-                }
-                if (!callbacks2) {
-                    callbacks2 = callbacks['']
-                }
-                if (callbacks2) {
-                    callback = callbacks2[json[2] && json[2][0][0]]
-                    if (!callback) {
-                        callback = callbacks2['']
+                    if (!callbacks2) {
+                        for (const key in json[1] || {}) {
+                            callbacks2 = callbacks[key]
+                            if (callbacks2) {
+                                break
+                            }
+                        }
+                    }
+                    if (!callbacks2) {
+                        callbacks2 = callbacks['']
+                    }
+                    if (callbacks2) {
+                        callback = callbacks2[json[2] && json[2][0][0]]
+                        if (!callback) {
+                            callback = callbacks2['']
+                        }
+                    }
+                    if (callback) {
+                        callback(json)
+                        return
                     }
                 }
-                if (callback) {
-                    callback(json)
-                    return
+                if (this.state === 'open' && json[0] === 'Pong') {
+                    if (this.phoneConnected !== json[1]) {
+                        this.phoneConnected = json[1]
+                        this.emit ('connection-phone-change', { connected: this.phoneConnected })
+                        return
+                    }
                 }
-            }
-            if (this.logLevel === MessageLogLevel.unhandled) {
-                this.log('[Unhandled] ' + messageTag + ', ' + JSON.stringify(json), MessageLogLevel.unhandled)
+                if (this.logger.level === 'debug') {
+                    this.logger.debug({ unhandled: true }, messageTag + ',' + JSON.stringify(json))
+                }
+            } catch (error) {
+                this.logger.error ({ error }, `encountered error in decrypting message, closing`)
+                
+                if (this.state === 'open') this.unexpectedDisconnect (DisconnectReason.badSession)
+                else this.endConnection ()
             }
         }
     }
@@ -384,29 +392,6 @@ export class WAConnection extends Base {
 			*/
             if (diff > KEEP_ALIVE_INTERVAL_MS+5000) this.unexpectedDisconnect (DisconnectReason.lost)
             else if (this.conn) this.send ('?,,') // if its all good, send a keep alive request
-
-            // poll phone connection as well, 
-            // 5000 ms for timeout
-            this.checkPhoneConnection (this.connectOptions.phoneResponseTime || 7500) 
-            .then (connected => {
-                this.phoneConnected !== connected && this.emit ('connection-phone-change', {connected})
-                this.phoneConnected = connected
-            })
-
         }, KEEP_ALIVE_INTERVAL_MS)
-    }
-    /**
-     * Check if your phone is connected
-     * @param timeoutMs max time for the phone to respond
-     */
-    async checkPhoneConnection(timeoutMs = 5000) {
-        if (this.state !== 'open') return false
-
-        try {
-            const response = await this.query({json: ['admin', 'test'], timeoutMs, waitForOpen: false})
-            return response[1] as boolean
-        } catch (error) {
-            return false
-        }
     }
 }

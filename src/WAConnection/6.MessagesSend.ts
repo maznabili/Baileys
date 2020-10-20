@@ -9,7 +9,7 @@ import {
     WALocationMessage,
     WAContactMessage,
     WATextMessage,
-    WAMessageContent, WAMetric, WAFlag, WAMessage, BaileysError, MessageLogLevel, WA_MESSAGE_STATUS_TYPE, WAMessageProto, MediaConnInfo, MessageTypeProto, URL_REGEX, WAUrlInfo
+    WAMessageContent, WAMetric, WAFlag, WAMessage, BaileysError, WA_MESSAGE_STATUS_TYPE, WAMessageProto, MediaConnInfo, MessageTypeProto, URL_REGEX, WAUrlInfo
 } from './Constants'
 import { generateMessageID, sha256, hmacSign, aesEncrypWithIV, randomBytes, generateThumbnail, getMediaKeys, decodeMediaMessageBuffer, extensionForMediaMessage, whatsappID, unixTimestampSeconds  } from './Utils'
 import { Mutex } from './Mutex'
@@ -85,6 +85,8 @@ export class WAConnection extends Base {
     }
     /** Prepare a media message for sending */
     async prepareMessageMedia(buffer: Buffer, mediaType: MessageType, options: MessageOptions = {}) {
+        await this.waitForConnection ()
+
         if (mediaType === MessageType.document && !options.mimetype) {
             throw new Error('mimetype required to send a document')
         }
@@ -138,7 +140,7 @@ export class WAConnection extends Base {
                 }
             } catch (error) {
                 const isLast = host.hostname === json.hosts[json.hosts.length-1].hostname
-                this.log (`Error in uploading to ${host.hostname}${isLast ? '' : ', retrying...'}`, MessageLogLevel.info)
+                this.logger.error (`Error in uploading to ${host.hostname}${isLast ? '' : ', retrying...'}`)
             }
         }
         if (!mediaUrl) throw new Error('Media upload failed on all hosts')
@@ -241,7 +243,7 @@ export class WAConnection extends Base {
             return buff
         } catch (error) {
             if (error instanceof BaileysError && error.status === 404) { // media needs to be updated
-                this.log (`updating media of message: ${message.key.id}`, MessageLogLevel.info)
+                this.logger.info (`updating media of message: ${message.key.id}`)
                 await this.updateMediaMessage (message)
                 const buff = await decodeMediaMessageBuffer (message.message, this.fetchRequest)
                 return buff
@@ -266,7 +268,7 @@ export class WAConnection extends Base {
     /** Query a string to check if it has a url, if it does, return required extended text message */
     async generateLinkPreview (text: string) {
         const query = ['query', {type: 'url', url: text, epoch: this.msgCount.toString()}, null]
-        const response = await this.query ({json: query, binaryTags: [26, WAFlag.ignore], expect200: true})
+        const response = await this.query ({json: query, binaryTags: [26, WAFlag.ignore], expect200: true, requiresPhoneConnection: false})
 
         if (response[1]) response[1].jpegThumbnail = response[2]
         const data = response[1] as WAUrlInfo
@@ -289,7 +291,7 @@ export class WAConnection extends Base {
         return this.mediaConn
     }
     protected async getNewMediaConn () {
-        const {media_conn} = await this.query({json: ['query', 'mediaConn']})
+        const {media_conn} = await this.query({json: ['query', 'mediaConn'], requiresPhoneConnection: false})
         return media_conn as MediaConnInfo
     }
 }

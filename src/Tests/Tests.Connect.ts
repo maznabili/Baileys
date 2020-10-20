@@ -2,7 +2,7 @@ import * as assert from 'assert'
 import {WAConnection} from '../WAConnection/WAConnection'
 import { AuthenticationCredentialsBase64, BaileysError, ReconnectMode, DisconnectReason } from '../WAConnection/Constants'
 import { delay } from '../WAConnection/Utils'
-import { assertChatDBIntegrity } from './Common'
+import { assertChatDBIntegrity, testJid } from './Common'
 
 describe('QR Generation', () => {
     it('should generate QR', async () => {
@@ -73,22 +73,41 @@ describe('Test Connect', () => {
     })
     it ('should disconnect & reconnect phone', async () => {
         const conn = new WAConnection ()
+        conn.logger.level = 'debug'
         await conn.loadAuthInfo('./auth_info.json').connect ()
         assert.equal (conn.phoneConnected, true)
 
         try {
             const waitForEvent = expect => new Promise (resolve => {
                 conn.on ('connection-phone-change', ({connected}) => {
-                    assert.equal (connected, expect)
-                    conn.removeAllListeners ('connection-phone-change')
-                    resolve ()
+                    if (connected === expect) {
+                        conn.removeAllListeners ('connection-phone-change')
+                        resolve ()
+                    }
                 })
             })
 
             console.log ('disconnect your phone from the internet')
+            await delay (10_000)
+            console.log ('phone should be disconnected now, testing...')
+
+            const messagesPromise = Promise.all (
+                [ 
+                    conn.loadMessages (testJid, 50),
+                    conn.getStatus (testJid),
+                    conn.getProfilePicture (testJid).catch (() => '')
+                ]
+            )
+
             await waitForEvent (false)
+            
             console.log ('reconnect your phone to the internet')
             await waitForEvent (true)
+
+            console.log ('reconnected successfully')
+
+            const final = await messagesPromise
+            assert.ok (final)
         } finally {
             conn.close ()
         }
@@ -108,6 +127,34 @@ describe ('Reconnects', () => {
 
         conn.close ()
     }
+    it('should dispose correctly on bad_session', async () => {
+        const conn = new WAConnection()
+        conn.autoReconnect = ReconnectMode.onAllErrors
+        conn.loadAuthInfo ('./auth_info.json')
+
+        let gotClose0 = false
+        let gotClose1 = false
+
+        conn.on ('intermediate-close', ({ reason }) => {
+            gotClose0 = true
+        })
+        conn.on ('close', ({ reason }) => {
+            if (reason === DisconnectReason.badSession) gotClose1 = true
+        })
+        setTimeout (() => conn['conn'].emit ('message', Buffer.from('some-tag,sdjjij1jo2ejo1je')), 1500)
+        await conn.connect ()
+
+        setTimeout (() => conn['conn'].emit ('message', Buffer.from('some-tag,sdjjij1jo2ejo1je')), 1500)
+
+        await new Promise (resolve => {
+            conn.on ('open', resolve)
+        })
+
+        assert.ok (gotClose0, 'did not receive bad_session close initially')
+        assert.ok (gotClose1, 'did not receive bad_session close')
+
+        conn.close ()
+    })
     /**
      * the idea is to test closing the connection at multiple points in the connection 
      * and see if the library cleans up resources correctly

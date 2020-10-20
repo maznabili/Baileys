@@ -1,7 +1,7 @@
 import * as QR from 'qrcode-terminal'
 import { WAConnection as Base } from './3.Connect'
-import { WAMessageStatusUpdate, WAMessage, WAContact, WAChat, WAMessageProto, WA_MESSAGE_STUB_TYPE, WA_MESSAGE_STATUS_TYPE, MessageLogLevel, PresenceUpdate, BaileysEvent, DisconnectReason, WANode, WAOpenResult, Presence, AuthenticationCredentials } from './Constants'
-import { whatsappID, unixTimestampSeconds, isGroupID, toNumber, GET_MESSAGE_ID, WA_MESSAGE_ID, waMessageKey } from './Utils'
+import { WAMessageStatusUpdate, WAMessage, WAContact, WAChat, WAMessageProto, WA_MESSAGE_STUB_TYPE, WA_MESSAGE_STATUS_TYPE, PresenceUpdate, BaileysEvent, DisconnectReason, WANode, WAOpenResult, Presence, AuthenticationCredentials } from './Constants'
+import { whatsappID, unixTimestampSeconds, isGroupID, GET_MESSAGE_ID, WA_MESSAGE_ID, waMessageKey } from './Utils'
 import KeyedDB from '@adiwajshing/keyed-db'
 import { Mutex } from './Mutex'
 
@@ -51,10 +51,8 @@ export class WAConnection extends Base {
                 chat.messages.insert (message)
                 this.emit ('message-update', message)
             } else {
-                chat.messages.insert (message)
-                this.emit ('message-new', message)
+                this.logger.debug ({ unhandled: true }, 'received message update for non-present message from ' + jid)
             }
-            
         })
         // If a user's contact has changed
         this.registerCallback (['action', null, 'user'], json => {
@@ -177,7 +175,7 @@ export class WAConnection extends Base {
     /** Get the URL to download the profile picture of a person/group */
     @Mutex (jid => jid)
     async getProfilePicture(jid: string | null) {
-        const response = await this.query({ json: ['query', 'ProfilePicThumb', jid || this.user.jid], expect200: true })
+        const response = await this.query({ json: ['query', 'ProfilePicThumb', jid || this.user.jid], expect200: true, requiresPhoneConnection: false })
         return response.eurl as string
     }
     protected forwardStatusUpdate (update: WAMessageStatusUpdate) {
@@ -201,8 +199,9 @@ export class WAConnection extends Base {
             name
         }
         this.chats.insert (chat)
-
-        await this.setProfilePicture (chat)
+        if (this.loadProfilePicturesForChatsAutomatically) {
+            await this.setProfilePicture (chat)
+        }
         this.emit ('chat-new', chat)
 
         return chat
@@ -236,7 +235,7 @@ export class WAConnection extends Base {
                 case WAMessageProto.ProtocolMessage.PROTOCOL_MESSAGE_TYPE.REVOKE:
                     const found = chat.messages.get (GET_MESSAGE_ID(protocolMessage.key))
                     if (found?.message) {
-                        this.log ('deleting message: ' + protocolMessage.key.id + ' in chat: ' + protocolMessage.key.remoteJid, MessageLogLevel.info)
+                        this.logger.info ('deleting message: ' + protocolMessage.key.id + ' in chat: ' + protocolMessage.key.remoteJid)
                         
                         found.messageStubType = WA_MESSAGE_STUB_TYPE.REVOKE
                         delete found.message

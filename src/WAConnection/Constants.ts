@@ -56,6 +56,7 @@ export interface WAQuery {
     expect200?: boolean
     waitForOpen?: boolean
     longTag?: boolean
+    requiresPhoneConnection?: boolean
 }
 export enum ReconnectMode {
     /** does not reconnect */
@@ -88,6 +89,8 @@ export type WAConnectOptions = {
     agent?: Agent
     /** agent used for fetch requests -- uploading/downloading media */
     fetchAgent?: Agent
+    /** Always uses takeover for connections */
+    alwaysUseTakeover?: boolean
 }
 /** from: https://stackoverflow.com/questions/3809401/what-is-a-good-regular-expression-to-match-a-url */
 export const URL_REGEX = /[-a-zA-Z0-9@:%._+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_+.~#?&//=]*)?/gi
@@ -113,12 +116,6 @@ export enum DisconnectReason {
   unknown = 'unknown',
   /** Well, the connection timed out */
   timedOut = 'timed out'
-}
-export enum MessageLogLevel {
-    none=0,
-    info=1,
-    unhandled=2,
-    all=3
 }
 export interface MediaConnInfo {
     auth: string 
@@ -434,4 +431,5 @@ export type BaileysEvent =
     'group-settings-update' |
     'group-description-update' |
     'received-pong' |
-    'credentials-updated'
+    'credentials-updated' |
+    'connection-validated'
