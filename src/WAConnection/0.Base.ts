@@ -27,7 +27,6 @@ import { EventEmitter } from 'events'
 import KeyedDB from '@adiwajshing/keyed-db'
 import { STATUS_CODES, Agent } from 'http'
 import pino from 'pino'
-import { rejects } from 'assert'
 
 const logger = pino({ prettyPrint: { levelFirst: true, ignore: 'hostname', translateTime: true },  prettifier: require('pino-pretty') })
 
@@ -44,7 +43,7 @@ export class WAConnection extends EventEmitter {
     state: WAConnectionState = 'close'
     connectOptions: WAConnectOptions = {
         regenerateQRIntervalMs: 30_000,
-        maxIdleTimeMs: 15_000,
+        maxIdleTimeMs: 40_000,
         waitOnlyForLastMessage: false,
         waitForChats: true,
         maxRetries: 10,
@@ -79,7 +78,6 @@ export class WAConnection extends EventEmitter {
     protected conn: WS = null
     protected msgCount = 0
     protected keepAliveReq: NodeJS.Timeout
-    protected callbacks: {[k: string]: any} = {}
     protected encoder = new Encoder()
     protected decoder = new Decoder()
     protected phoneCheckInterval = undefined
@@ -93,10 +91,10 @@ export class WAConnection extends EventEmitter {
 
     protected mediaConn: MediaConnInfo
     protected debounceTimeout: NodeJS.Timeout
-    protected rejectPendingConnection = (e: Error) => {}
 
     constructor () {
         super ()
+        this.setMaxListeners (20)
         this.on ('CB:Cmd,type:disconnect', json => (
             this.state === 'open' && this.unexpectedDisconnect(json[1].kind || 'unknown')
         ))
@@ -181,14 +179,22 @@ export class WAConnection extends EventEmitter {
         if (!this.phoneCheckInterval && requiresPhoneConnection) {
             this.startPhoneCheckInterval ()
         }
+        let onRecv: (json) => void
+        let onErr: (err) => void
         try {
             const result = await Utils.promiseTimeout(timeoutMs,
-                (resolve, reject) => (this.callbacks[tag] = { queryJSON: json, callback: resolve, errCallback: reject }),
+                (resolve, reject) => {
+                    onRecv = resolve
+                    onErr = ({reason}) => reject(new Error(reason))
+                    this.on (`TAG:${tag}`, onRecv)
+                    this.on ('ws-close', onErr) // if the socket closes, you'll never receive the message
+                },
             )
             return result as any
         } finally {
             requiresPhoneConnection && this.clearPhoneCheckInterval ()
-            delete this.callbacks[tag]
+            this.off (`TAG:${tag}`, onRecv)
+            this.off (`ws-close`, onErr)
         }
     }
     /** Generic function for action, set queries */
@@ -213,6 +219,10 @@ export class WAConnection extends EventEmitter {
         tag = tag || this.generateMessageTag (longTag)
         const promise = this.waitForMessage(tag, json, requiresPhoneConnection, timeoutMs)
 
+        if (this.logger.level === 'trace') {
+            this.logger.trace ({ fromMe: true },`${tag},${JSON.stringify(json)}`)
+        }
+
         if (binaryTags) tag = await this.sendBinary(json as WANode, binaryTags, tag)
         else tag = await this.sendJSON(json, tag)
 
@@ -232,7 +242,7 @@ export class WAConnection extends EventEmitter {
                 {query: json, message, status: response.status}
             )
         }
-        if (startDebouncedTimeout) this.stopDebouncedTimeout ()
+        if (startDebouncedTimeout) this.startDebouncedTimeout ()
         return response
     }
     /** interval is started when a query takes too long to respond */
@@ -252,6 +262,7 @@ export class WAConnection extends EventEmitter {
         this.phoneCheckInterval && clearInterval (this.phoneCheckInterval)
         this.phoneCheckInterval = undefined
     }
+    /** checks for phone connection */
     protected async sendAdminTest () {
         return this.sendJSON (['admin', 'test'])
     }
@@ -282,7 +293,10 @@ export class WAConnection extends EventEmitter {
     }
     protected startDebouncedTimeout () {
         this.stopDebouncedTimeout ()
-        this.debounceTimeout = setTimeout (() => this.rejectPendingConnection(TimedOutError()), this.connectOptions.maxIdleTimeMs)
+        this.debounceTimeout = setTimeout (
+            () => this.emit('ws-close', { reason: DisconnectReason.timedOut }), 
+            this.connectOptions.maxIdleTimeMs
+        )
     }
     protected stopDebouncedTimeout ()  {
         this.debounceTimeout && clearTimeout (this.debounceTimeout)
@@ -371,7 +385,8 @@ export class WAConnection extends EventEmitter {
         this.keepAliveReq && clearInterval(this.keepAliveReq)
         this.clearPhoneCheckInterval ()
 
-        this.rejectPendingConnection && this.rejectPendingConnection (new Error('close'))
+        this.emit ('ws-close', { reason: DisconnectReason.close })
+        //this.rejectPendingConnection && this.rejectPendingConnection (new Error('close'))
 
         try {
             this.conn?.close()
@@ -379,15 +394,9 @@ export class WAConnection extends EventEmitter {
         } catch {
 
         }
-        this.conn = null
-        this.lastSeen = null
+        this.conn = undefined
+        this.lastSeen = undefined
         this.msgCount = 0
-
-        Object.keys(this.callbacks).forEach(key => {
-            this.logger.debug (`cancelling message wait: ${key}`)
-            this.callbacks[key].errCallback(new Error('close'))
-            delete this.callbacks[key]
-        })
     }
     /**
      * Does a fetch request with the configuration of the connection
