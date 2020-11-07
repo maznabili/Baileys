@@ -9,6 +9,7 @@
  If you're interested in building a WhatsApp bot, you may wanna check out [WhatsAppInfoBot](https://github.com/adiwajshing/WhatsappInfoBot) and an actual bot built with it, [Messcat](https://github.com/adiwajshing/Messcat).
  
  **Read the docs [here](https://adiwajshing.github.io/Baileys)**
+ **Join the Discord [here](https://discord.gg/7FYURJyqng)**
 
 ## Example
 Do check out & run [example.ts](Example/example.ts) to see example usage of the library.
@@ -243,7 +244,7 @@ const buffer = fs.readFileSync("Media/ma_gif.mp4") // load some gif
 const options: MessageOptions = {mimetype: Mimetype.gif, caption: "hello!"} // some metadata & caption
 conn.sendMessage(id, buffer, MessageType.video, options)
 // send an audio file
-const buffer = fs.readFileSync("Media/audio.mp3") // can send mp3, mp4, & ogg -- but for mp3 files the mimetype must be set to ogg
+const buffer = fs.readFileSync("Media/audio.mp3") // can send mp3, mp4, & ogg
 const options: MessageOptions = {mimetype: Mimetype.mp4Audio} // some metadata (can't have caption in audio)
 conn.sendMessage(id, buffer, MessageType.audio, options)
 ```
@@ -371,9 +372,9 @@ await conn.deleteChat (jid) // will delete the chat (can be a group or broadcast
     ```
 - To check if a given ID is on WhatsApp
     ``` ts
-    const id = 'xyz@s.whatsapp.net'
+    const id = '123456'
     const exists = await conn.isOnWhatsApp (id)
-    console.log (`${id} ${exists ? " exists " : " does not exist"} on WhatsApp`)
+    if (exists) console.log (`${id} exists on WhatsApp, as jid: ${exists.jid}`)
     ```
 - To query chat history on a group or with someone
     ``` ts
@@ -480,7 +481,7 @@ Baileys is written, keeping in mind, that you may require other custom functiona
 
 First, enable the logging of unhandled messages from WhatsApp by setting
 ``` ts
-conn.logger.level = 'unhandled'
+conn.logger.level = 'debug'
 ```
 This will enable you to see all sorts of messages WhatsApp sends in the console. Some examples:
 
