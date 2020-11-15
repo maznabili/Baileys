@@ -32,7 +32,7 @@ const logger = pino({ prettyPrint: { levelFirst: true, ignore: 'hostname', trans
 
 export class WAConnection extends EventEmitter {
     /** The version of WhatsApp Web we're telling the servers we are */
-    version: [number, number, number] = [2, 2045, 15]
+    version: [number, number, number] = [2, 2045, 19]
     /** The Browser we're telling the WhatsApp Web servers we are */
     browserDescription: [string, string, string] = Utils.Browsers.baileys ('Chrome')
     /** Metadata like WhatsApp id, name set on WhatsApp etc. */
@@ -43,9 +43,9 @@ export class WAConnection extends EventEmitter {
     state: WAConnectionState = 'close'
     connectOptions: WAConnectOptions = {
         regenerateQRIntervalMs: 30_000,
-        maxIdleTimeMs: 40_000,
+        maxIdleTimeMs: 15_000,
         waitOnlyForLastMessage: false,
-        waitForChats: true,
+        waitForChats: false,
         maxRetries: 10,
         connectCooldownMs: 4000,
         phoneResponseTime: 15_000,
@@ -67,6 +67,7 @@ export class WAConnection extends EventEmitter {
     maxCachedMessages = 50
     loadProfilePicturesForChatsAutomatically = true
 
+    lastChatsReceived: Date
     chats = new KeyedDB (Utils.waChatKey(false), value => value.jid)
     contacts: { [k: string]: WAContact } = {}
 
@@ -325,6 +326,9 @@ export class WAConnection extends EventEmitter {
         let onOpen: () => void
         let onClose: ({ reason }) => void
 
+        if (this.pendingRequestTimeoutMs <= 0) {
+            throw new BaileysError(DisconnectReason.close, { status: 428 })
+        }
         await (
             Utils.promiseTimeout (
                 this.pendingRequestTimeoutMs, 
@@ -355,7 +359,9 @@ export class WAConnection extends EventEmitter {
             //throw new Error("You're not even connected, you can't log out")
             await new Promise(resolve => this.conn.send('goodbye,["admin","Conn","disconnect"]', null, resolve))
         }
-        this.user = null
+        this.user = undefined
+        this.chats.clear()
+        this.contacts = {}
         this.close()
     }
     /** Close the connection to WhatsApp Web */
