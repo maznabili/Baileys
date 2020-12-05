@@ -8,6 +8,7 @@ import {
 } from '../WAConnection/Constants'
 import { generateProfilePicture, whatsappID } from './Utils'
 import { Mutex } from './Mutex'
+import { URL } from 'url'
 
 // All user related functions -- get profile picture, set status etc.
 
@@ -18,26 +19,47 @@ export class WAConnection extends Base {
      * @returns undefined if the number doesn't exists, otherwise the correctly formatted jid
      */
     isOnWhatsApp = async (str: string) => {
+        if (this.state !== 'open') {
+            return this.isOnWhatsAppNoConn(str)
+        }
         const { status, jid } = await this.query({json: ['query', 'exist', str], requiresPhoneConnection: false})
         if (status === 200) return { exists: true, jid: whatsappID(jid) }
-    } 
+    }
+    /** 
+     * Query whether a given number is registered on WhatsApp, without needing to open a WS connection
+     * @param str phone number/jid you want to check for
+     * @returns undefined if the number doesn't exists, otherwise the correctly formatted jid
+     */
+    isOnWhatsAppNoConn = async (str: string) => {
+        let phone = str.split('@')[0]
+        const url = `https://wa.me/${phone}`
+        const response = await this.fetchRequest(url, 'GET', undefined, undefined, undefined, 'manual')
+        const loc = response.headers.get('Location')
+        if (!loc) {
+            this.logger.warn({ url, status: response.status }, 'did not get location from request')
+            return
+        }
+        const locUrl = new URL('', loc)
+        if (!locUrl.pathname.endsWith('send/')) {
+            return
+        }
+        phone = locUrl.searchParams.get('phone')
+        return { exists: true, jid: `${phone}@s.whatsapp.net` } 
+    }
     /**
      * Tell someone about your presence -- online, typing, offline etc.
      * @param jid the ID of the person/group who you are updating
      * @param type your presence
      */
-    updatePresence = (jid: string | null, type: Presence) =>
-        this.query(
-            {
-                json: [
-                    'action',
-                    { epoch: this.msgCount.toString(), type: 'set' },
-                    [['presence', { type: type, to: jid }, null]],
-                ], 
-                binaryTags: [WAMetric.group, WAFlag.acknowledge], 
-                expect200: true
-            }
-        ) as Promise<{status: number}>
+    updatePresence = (jid: string | null, type: Presence) => this.sendBinary(
+        [   'action', 
+            {epoch: this.msgCount.toString(), type: 'set'},
+            [ ['presence', { type: type, to: jid }, null] ]
+        ],
+        [WAMetric.presence, WAFlag[type] ], // weird stuff WA does
+        undefined,
+        true
+    )
     /** Request an update on the presence of a user */
     requestPresenceUpdate = async (jid: string) => this.query({ json: ['action', 'presence', 'subscribe', jid] })
     /** Query the status of the person (see groupMetadata() for groups) */
@@ -86,16 +108,6 @@ export class WAConnection extends Base {
     }
     /** Query broadcast list info */
     async getBroadcastListInfo(jid: string) { return this.query({json: ['query', 'contact', jid], expect200: true }) as Promise<WABroadcastListInfo> }
-    /** Delete the chat of a given ID */
-    async deleteChat (jid: string) {
-        const response = await this.setQuery ([ ['chat', {type: 'delete', jid: jid}, null] ], [12, WAFlag.ignore])
-        const chat = this.chats.get (jid)
-        if (chat) {
-            this.chats.delete (chat)
-            this.emit ('chat-update', { jid, delete: 'true' })
-        }
-        return response
-    }
     /**
      * Load chats in a paginated manner + gets the profile picture
      * @param before chats before the given cursor

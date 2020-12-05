@@ -1,6 +1,7 @@
 import { WA } from '../Binary/Constants'
 import { proto } from '../../WAMessage/WAMessage'
 import { Agent } from 'https'
+import KeyedDB from '@adiwajshing/keyed-db'
 
 export const WS_URL = 'wss://web.whatsapp.com/ws'
 export const DEFAULT_ORIGIN = 'https://web.whatsapp.com'
@@ -17,9 +18,14 @@ export type WAMessageKey = proto.IMessageKey
 export type WATextMessage = proto.ExtendedTextMessage
 export type WAContextInfo = proto.IContextInfo
 export type WAGenericMediaMessage = proto.IVideoMessage | proto.IImageMessage | proto.IAudioMessage | proto.IDocumentMessage | proto.IStickerMessage
-export import WA_MESSAGE_STUB_TYPE = proto.WebMessageInfo.WEB_MESSAGE_INFO_STUBTYPE
-export import WA_MESSAGE_STATUS_TYPE = proto.WebMessageInfo.WEB_MESSAGE_INFO_STATUS
-import KeyedDB from '@adiwajshing/keyed-db'
+export import WA_MESSAGE_STUB_TYPE = proto.WebMessageInfo.WebMessageInfoStubType
+export import WA_MESSAGE_STATUS_TYPE = proto.WebMessageInfo.WebMessageInfoStatus
+
+export type WAInitResponse = {
+    ref: string
+    ttl: number
+    status: 200
+}
 
 export interface WALocationMessage {
     degreesLatitude: number
@@ -73,7 +79,10 @@ export type WALoadChatOptions = {
     loadProfilePicture?: boolean
 }
 export type WAConnectOptions = {
-    /** New QR generation interval, set to null if you don't want to regenerate */
+    /** 
+     * New QR generation interval, set to null if you don't want to regenerate 
+     * @deprecated no need to set this as we use WA ttl
+     * */
     regenerateQRIntervalMs?: number
     /** fails the connection if no data is received for X seconds */
     maxIdleTimeMs?: number
@@ -171,13 +180,17 @@ export interface WAGroupMetadata {
     restrict?: 'true' | 'false' 
     /** is set when the group only allows admins to write messages */
     announce?: 'true' | 'false' 
-    participants: [{ id: string; isAdmin: boolean; isSuperAdmin: boolean }]
+    participants: { id: string; isAdmin: boolean; isSuperAdmin: boolean }[]
 }
 export interface WAGroupModification {
     status: number
     participants?: { [key: string]: any }
 }
-
+export interface WAPresenceData {
+    lastKnownPresence?: Presence
+    lastSeen?: number
+    name?: string
+}
 export interface WAContact {
     verify?: string
     /** name of the contact, the contact has set on their own on WA */
@@ -191,12 +204,10 @@ export interface WAContact {
     /** short name for the contact */
     short?: string
     // Baileys Added
-    lastKnownPresence?: Presence
-    lastSeen?: number
+    imgUrl?: string
 }
 export interface WAUser extends WAContact {
     phone: any
-    imgUrl?: string
 }
 export interface WAChat {
     jid: string
@@ -215,7 +226,10 @@ export interface WAChat {
     // Baileys added properties
     messages: KeyedDB<WAMessage, string>
     imgUrl?: string
+    presences?: { [k: string]: WAPresenceData }
+    metadata?: WAGroupMetadata
 }
+export type WAChatUpdate = Partial<WAChat> & { jid: string, hasNewMessage?: boolean }
 export enum WAMetric {
     debugLog = 1,
     queryResume = 2,
@@ -249,22 +263,24 @@ export enum WAMetric {
 export const STORIES_JID = 'status@broadcast'
 
 export enum WAFlag {
+    available = 160,
     ignore = 1 << 7,
     acknowledge = 1 << 6,
-    available = 1 << 5,
     unavailable = 1 << 4,
     expires = 1 << 3,
-    skipOffline = 1 << 2,
+    composing = 1 << 2,
+    recording = 1 << 2,
+    paused = 1 << 2
 }
 /** Tag used with binary queries */
 export type WATag = [WAMetric, WAFlag]
 /** set of statuses visible to other people; see updatePresence() in WhatsAppWeb.Send */
 export enum Presence {
-    available = 'available', // "online"
     unavailable = 'unavailable', // "offline"
+    available = 'available', // "online"
     composing = 'composing', // "typing..."
     recording = 'recording', // "recording..."
-    paused = 'paused', // I have no clue
+    paused = 'paused', // stop typing
 }
 /** Set of message types that are supported by the library */
 export enum MessageType {
@@ -295,7 +311,8 @@ export enum ChatModification {
     pin='pin',
     unpin='unpin',
     mute='mute',
-    unmute='unmute'
+    unmute='unmute',
+    delete='delete'
 }
 export const HKDFInfoKeys = {
     [MessageType.image]: 'WhatsApp Image Keys',
@@ -344,6 +361,8 @@ export interface MessageOptions {
     duration?: number
     /** Fetches new media options for every media file */
     forceNewMediaOptions?: boolean
+    /** Wait for the message to be sent to the server (default true) */
+    waitForAck?: boolean
 }
 export interface WABroadcastListInfo {
     status: number
@@ -426,7 +445,6 @@ export type BaileysEvent =
     'ws-close' | 
     'qr' |
     'connection-phone-change' |
-    'user-presence-update' |
     'user-status-update' |
     'contacts-received' |
     'chats-received' |

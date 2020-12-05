@@ -11,7 +11,9 @@ export class WAConnection extends Base {
     /** Connect to WhatsApp Web */
     async connect () {
         // if we're already connected, throw an error
-        if (this.state !== 'close') throw new Error('cannot connect when state=' + this.state)
+        if (this.state !== 'close') {
+            throw new BaileysError('cannot connect when state=' + this.state, { status: 409 })
+        }
         
         const options = this.connectOptions
         const newConnection = !this.authInfo
@@ -60,6 +62,7 @@ export class WAConnection extends Base {
     protected async connectInternal (options: WAConnectOptions, delayMs?: number) {
         const rejections: ((e?: Error) => void)[] = []
         const rejectAll = (e: Error) => rejections.forEach (r => r(e))
+        const rejectAllOnWSClose = ({ reason }) => rejectAll(new Error(reason))
         // actual connect
         const connect = () => (
             new Promise((resolve, reject) => {
@@ -83,13 +86,16 @@ export class WAConnection extends Base {
                         'Sec-WebSocket-Extensions': 'permessage-deflate; client_max_window_bits',
                     }
                 })
-                this.conn.addEventListener('message', ({data}) => this.onMessageRecieved(data as any))
+
+                this.conn.on('message', data => this.onMessageRecieved(data as any))
                 
-                this.conn.on ('open', async () => {
+                this.conn.once('open', async () => {
+                    this.startKeepAliveRequest()
                     this.logger.info(`connected to WhatsApp Web server, authenticating via ${reconnectID ? 'reconnect' : 'takeover'}`)
+
                     let waitForChats: Promise<{ hasNewChats: boolean }>
                     // add wait for chats promise if required
-                    if (typeof options?.waitForChats === 'undefined' ? true : options?.waitForChats) {
+                    if (options?.waitForChats) {
                         const {wait, cancellations} = this.receiveChatsAndContacts(this.connectOptions.waitOnlyForLastMessage)
                         waitForChats = wait
                         rejections.push (...cancellations)
@@ -101,10 +107,10 @@ export class WAConnection extends Base {
                                 waitForChats || undefined
                             ]
                         )
-                        this.startKeepAliveRequest()
+                        
                         this.conn
-                            .removeAllListeners ('error')
-                            .removeAllListeners ('close')
+                            .removeAllListeners('error')
+                            .removeAllListeners('close')
                         this.stopDebouncedTimeout ()
                         resolve ({ ...authResult, ...chatsResult })
                     } catch (error) {
@@ -116,7 +122,7 @@ export class WAConnection extends Base {
             }) as Promise<{ hasNewChats?: boolean, isNewUser: boolean }>
         )
 
-        this.on ('ws-close', rejectAll)
+        this.on ('ws-close', rejectAllOnWSClose)
         try {
             if (delayMs) {
                 const {delay, cancel} = Utils.delayCancellable (delayMs)
@@ -129,7 +135,7 @@ export class WAConnection extends Base {
             this.endConnection ()
             throw error
         } finally {
-            this.off ('ws-close', rejectAll)
+            this.off ('ws-close', rejectAllOnWSClose)
         }
     }
     /**
@@ -186,7 +192,7 @@ export class WAConnection extends Base {
             if (!json) return 
 
             if (this.logger.level === 'trace') {
-                this.logger.trace(messageTag + ', ' + JSON.stringify(json))
+                this.logger.trace(messageTag + ',' + JSON.stringify(json))
             }
 
             let anyTriggered = false

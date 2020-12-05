@@ -7,20 +7,17 @@ import { assertChatDBIntegrity, makeConnection, testJid } from './Common'
 describe('QR Generation', () => {
     it('should generate QR', async () => {
         const conn = makeConnection ()
-        conn.connectOptions.regenerateQRIntervalMs = 5000
+        conn.connectOptions.maxRetries = 0
 
         let calledQR = 0
         conn.removeAllListeners ('qr')
-        conn.on ('qr', qr => calledQR += 1)
+        conn.on ('qr', () => calledQR += 1)
         
         await conn.connect()
             .then (() => assert.fail('should not have succeeded'))
-            .catch (error => {
-                assert.equal (error.message, 'timed out')
-            })
-        assert.deepEqual (conn['pendingRequests'], [])
-        assert.deepEqual (
-            Object.keys(conn['callbacks']).filter(key => !key.startsWith('function:')), 
+            .catch (error => {})
+        assert.deepStrictEqual (
+            Object.keys(conn.eventNames()).filter(key => key.startsWith('TAG:')), 
             []
         )
         assert.ok(calledQR >= 2, 'QR not called')
@@ -75,7 +72,7 @@ describe('Test Connect', () => {
         const conn = makeConnection ()
         conn.logger.level = 'debug'
         await conn.loadAuthInfo('./auth_info.json').connect ()
-        assert.equal (conn.phoneConnected, true)
+        assert.strictEqual (conn.phoneConnected, true)
 
         try {
             const waitForEvent = expect => new Promise (resolve => {
@@ -220,7 +217,7 @@ describe ('Reconnects', () => {
         conn.autoReconnect = ReconnectMode.onConnectionLost
 
         await conn.loadAuthInfo('./auth_info.json').connect ()
-        assert.equal (conn.phoneConnected, true)
+        assert.strictEqual (conn.phoneConnected, true)
 
         try {
             const closeConn = () => conn['conn']?.terminate ()
@@ -272,7 +269,7 @@ describe ('Reconnects', () => {
         conn.autoReconnect = ReconnectMode.onConnectionLost
 
         await conn.loadAuthInfo('./auth_info.json').connect ()
-        assert.equal (conn.phoneConnected, true)
+        assert.strictEqual (conn.phoneConnected, true)
 
         await delay (30*1000)
 

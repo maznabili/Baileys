@@ -3,7 +3,7 @@ import WS from 'ws'
 import * as Utils from './Utils'
 import Encoder from '../Binary/Encoder'
 import Decoder from '../Binary/Decoder'
-import fetch from 'node-fetch'
+import fetch, { RequestRedirect } from 'node-fetch'
 import {
     AuthenticationCredentials,
     WAUser,
@@ -21,7 +21,6 @@ import {
     WAConnectOptions,
     MediaConnInfo,
     DEFAULT_ORIGIN,
-    TimedOutError,
 } from './Constants'
 import { EventEmitter } from 'events'
 import KeyedDB from '@adiwajshing/keyed-db'
@@ -32,7 +31,7 @@ const logger = pino({ prettyPrint: { levelFirst: true, ignore: 'hostname', trans
 
 export class WAConnection extends EventEmitter {
     /** The version of WhatsApp Web we're telling the servers we are */
-    version: [number, number, number] = [2, 2045, 19]
+    version: [number, number, number] = [2, 2047, 10]
     /** The Browser we're telling the WhatsApp Web servers we are */
     browserDescription: [string, string, string] = Utils.Browsers.baileys ('Chrome')
     /** Metadata like WhatsApp id, name set on WhatsApp etc. */
@@ -42,10 +41,7 @@ export class WAConnection extends EventEmitter {
     /** The connection state */
     state: WAConnectionState = 'close'
     connectOptions: WAConnectOptions = {
-        regenerateQRIntervalMs: 30_000,
-        maxIdleTimeMs: 15_000,
-        waitOnlyForLastMessage: false,
-        waitForChats: false,
+        maxIdleTimeMs: 60_000,
         maxRetries: 10,
         connectCooldownMs: 4000,
         phoneResponseTime: 15_000,
@@ -85,7 +81,7 @@ export class WAConnection extends EventEmitter {
 
     protected referenceDate = new Date () // used for generating tags
     protected lastSeen: Date = null // last keep alive received
-    protected qrTimeout: NodeJS.Timeout
+    protected initTimeout: NodeJS.Timeout
 
     protected lastDisconnectTime: Date = null
     protected lastDisconnectReason: DisconnectReason 
@@ -93,13 +89,6 @@ export class WAConnection extends EventEmitter {
     protected mediaConn: MediaConnInfo
     protected debounceTimeout: NodeJS.Timeout
 
-    constructor () {
-        super ()
-        this.setMaxListeners (20)
-        this.on ('CB:Cmd,type:disconnect', json => (
-            this.state === 'open' && this.unexpectedDisconnect(json[1].kind || 'unknown')
-        ))
-    }
     /**
      * Connect to WhatsAppWeb
      * @param options the connect options
@@ -132,6 +121,10 @@ export class WAConnection extends EventEmitter {
             encKey: this.authInfo.encKey.toString('base64'),
             macKey: this.authInfo.macKey.toString('base64'),
         }
+    }
+    /** Can you login to WA without scanning the QR */
+    canLogin () {
+        return !!this.authInfo?.encKey && !!this.authInfo?.macKey
     }
     /** Clear authentication info so a new connection can be created */
     clearAuthInfo () {
@@ -176,7 +169,7 @@ export class WAConnection extends EventEmitter {
      * @param json query that was sent
      * @param timeoutMs timeout after which the promise will reject
      */
-    async waitForMessage(tag: string, json: Object, requiresPhoneConnection: boolean, timeoutMs?: number) {
+    async waitForMessage(tag: string, requiresPhoneConnection: boolean, timeoutMs?: number) {
         if (!this.phoneCheckInterval && requiresPhoneConnection) {
             this.startPhoneCheckInterval ()
         }
@@ -211,14 +204,14 @@ export class WAConnection extends EventEmitter {
      * @param timeoutMs timeout after which the query will be failed (set to null to disable a timeout)
      * @param tag the tag to attach to the message
      */
-    async query(q: WAQuery) {
+    async query(q: WAQuery): Promise<any> {
         let {json, binaryTags, tag, timeoutMs, expect200, waitForOpen, longTag, requiresPhoneConnection, startDebouncedTimeout} = q
         requiresPhoneConnection = requiresPhoneConnection !== false
         waitForOpen = waitForOpen !== false
         if (waitForOpen) await this.waitForConnection()
 
         tag = tag || this.generateMessageTag (longTag)
-        const promise = this.waitForMessage(tag, json, requiresPhoneConnection, timeoutMs)
+        const promise = this.waitForMessage(tag, requiresPhoneConnection, timeoutMs)
 
         if (this.logger.level === 'trace') {
             this.logger.trace ({ fromMe: true },`${tag},${JSON.stringify(json)}`)
@@ -386,13 +379,12 @@ export class WAConnection extends EventEmitter {
         this.conn?.removeAllListeners ('open')
         this.conn?.removeAllListeners ('message')
 
-        this.qrTimeout && clearTimeout (this.qrTimeout)
+        this.initTimeout && clearTimeout (this.initTimeout)
         this.debounceTimeout && clearTimeout (this.debounceTimeout)
         this.keepAliveReq && clearInterval(this.keepAliveReq)
         this.clearPhoneCheckInterval ()
 
         this.emit ('ws-close', { reason: DisconnectReason.close })
-        //this.rejectPendingConnection && this.rejectPendingConnection (new Error('close'))
 
         try {
             this.conn?.close()
@@ -407,10 +399,11 @@ export class WAConnection extends EventEmitter {
     /**
      * Does a fetch request with the configuration of the connection
      */
-    protected fetchRequest = (endpoint: string, method: string = 'GET', body?: any, agent?: Agent, headers?: {[k: string]: string}) => (
+    protected fetchRequest = (endpoint: string, method: string = 'GET', body?: any, agent?: Agent, headers?: {[k: string]: string}, redirect: RequestRedirect = 'follow') => (
         fetch(endpoint, {
             method,
             body,
+            redirect,
             headers: { Origin: DEFAULT_ORIGIN, ...(headers || {}) },
             agent: agent || this.connectOptions.fetchAgent
         })

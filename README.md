@@ -96,8 +96,6 @@ console.log ("oh hello " + conn.user.name + "! You connected via a proxy")
 The entire `WAConnectOptions` struct is mentioned here with default values:
 ``` ts
 conn.connectOptions = {
-    /** New QR generation interval, set to null if you don't want to regenerate */
-    regenerateQRIntervalMs?: 30_000,
     /** fails the connection if no data is received for X seconds */
     maxIdleTimeMs?: 15_000,
     /** maximum attempts to connect */
@@ -195,20 +193,18 @@ on (event: 'credentials-updated', listener: (auth: AuthenticationCredentials) =>
 on (event: 'qr', listener: (qr: string) => void): this
 /** when the connection to the phone changes */
 on (event: 'connection-phone-change', listener: (state: {connected: boolean}) => void): this
-/** when a user's presence is updated */
-on (event: 'user-presence-update', listener: (update: PresenceUpdate) => void): this
 /** when a user's status is updated */
 on (event: 'user-status-update', listener: (update: {jid: string, status?: string}) => void): this
 /** when a new chat is added */
 on (event: 'chat-new', listener: (chat: WAChat) => void): this
 /** when contacts are sent by WA */
 on (event: 'contacts-received', listener: () => void): this
-/** when chats are sent by WA */
-on (event: 'chats-received', listener: (update: {hasNewChats: boolean}) => void): this
+/** when chats are sent by WA, and when all messages are received from WhatsApp */
+on (event: 'chats-received', listener: (update: {hasNewChats?: boolean, hasReceivedLastMessage?: boolean}) => void): this
 /** when multiple chats are updated (new message, updated message, deleted, pinned, etc) */
-on (event: 'chats-update', listener: (chats: (Partial<WAChat> & { jid: string })[]) => void): this
-/** when a chat is updated (new message, updated message, deleted, pinned, etc) */
-on (event: 'chat-update', listener: (chat: Partial<WAChat> & { jid: string }) => void): this
+on (event: 'chats-update', listener: (chats: WAChatUpdate[]) => void): this
+/** when a chat is updated (new message, updated message, deleted, pinned, presence updated etc) */
+on (event: 'chat-update', listener: (chat: Partial<WAChat> & { hasNewMessage: boolean }) => void): this
 /** when a message's status is updated (deleted, delivered, read, sent etc.) */
 on (event: 'message-status-update', listener: (message: WAMessageStatusUpdate) => void): this
 /** when participants are added to a group */
@@ -251,6 +247,8 @@ conn.sendMessage(id, buffer, MessageType.audio, options)
 To note:
 - `id` is the WhatsApp ID of the person or group you're sending the message to. 
     - It must be in the format ```[country code][phone number]@s.whatsapp.net```, for example ```+19999999999@s.whatsapp.net``` for people. For groups, it must be in the format ``` 123456789-123345@g.us ```. 
+    - For broadcast lists it's `[timestamp of creation]@broadcast`.
+    - For stories, the ID is `status@broadcast`.
 - For media messages, the thumbnail can be generated automatically for images & stickers. Thumbnails for videos can also be generated automatically, though, you need to have `ffmpeg` installed on your system.
 - **MessageOptions**: some extra info about the message. It can have the following __optional__ values:
     ``` ts
@@ -307,6 +305,7 @@ export enum Presence {
     available = 'available', // "online"
     composing = 'composing', // "typing..."
     recording = 'recording', // "recording..."
+    paused = 'paused' // stopped typing, back to "online"
 }
 ```
 
@@ -355,7 +354,7 @@ setTimeout (() => {
     conn.modifyChat (jid, ChatModification.unmute)
 }, 5000) // unmute after 5 seconds
 
-await conn.deleteChat (jid) // will delete the chat (can be a group or broadcast list as well)
+await conn.modifyChat (jid, ChatModification.delete) // will delete the chat (can be a group or broadcast list as well)
 ```
 
 **Note:** to unmute or unpin a chat, one must pass the timestamp of the pinning or muting. This is returned by the pin & mute functions. This is also available in the `WAChat` objects of the respective chats, as a `mute` or `pin` property.
@@ -370,6 +369,7 @@ await conn.deleteChat (jid) // will delete the chat (can be a group or broadcast
     }
     ```
 - To check if a given ID is on WhatsApp
+    Note: this method falls back to using `https://wa.me` to determine whether a number is on WhatsApp in case the WebSocket connection is not open yet.
     ``` ts
     const id = '123456'
     const exists = await conn.isOnWhatsApp (id)
@@ -435,6 +435,14 @@ Of course, replace ``` xyz ``` with an actual ID.
     // id & people to make admin (will throw error if it fails)
     await conn.groupMakeAdmin ("abcd-xyz@g.us", ["abcd@s.whatsapp.net", "efgh@s.whatsapp.net"])
     await conn.groupDemoteAdmin ("abcd-xyz@g.us", ["abcd@s.whatsapp.net", "efgh@s.whatsapp.net"]) // demote admins
+    ```
+- To change the group's subject
+    ``` ts
+    await conn.groupUpdateSubject("abcd-xyz@g.us", "New Subject!")
+    ```
+- To change the group's description
+    ``` ts
+    await conn.groupUpdateDescription("abcd-xyz@g.us", "This group has a new description")
     ```
 - To change group settings
     ``` ts

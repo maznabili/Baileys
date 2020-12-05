@@ -18,7 +18,6 @@ async function example() {
     conn.logger.level = 'debug' // set to 'debug' to see what kind of stuff you can implement
     // attempt to reconnect at most 10 times in a row
     conn.connectOptions.maxRetries = 10
-    conn.connectOptions.waitForChats = false
     conn.chatOrderingKey = waChatKey(true) // order chats such that pinned chats are on top
 
     conn.on ('credentials-updated', () => {
@@ -31,7 +30,7 @@ async function example() {
         console.log(`you have ${conn.chats.length} chats, new chats available: ${hasNewChats}`)
     })
     conn.on('contacts-received', () => {
-        console.log(`you have ${Object.keys(conn.contacts).length} chats`)
+        console.log(`you have ${Object.keys(conn.contacts).length} contacts`)
     })
 
     // loads the auth file credentials if present
@@ -47,14 +46,16 @@ async function example() {
 
     /*  Note: one can take this auth_info.json file and login again from any computer without having to scan the QR code, 
         and get full access to one's WhatsApp. Despite the convenience, be careful with this file */
-    conn.on ('user-presence-update', json => console.log(json.id + ' presence is ' + json.type))
     conn.on ('message-status-update', json => {
         const participant = json.participant ? ' (' + json.participant + ')' : '' // participant exists when the message is from a group
         console.log(`${json.to}${participant} acknlowledged message(s) ${json.ids} as ${json.type}`)
     })
     conn.on('chat-update', async chat => {
-        // only do something when a new message is received; i.e. the unread count is updated
-        if (!chat.count) return 
+        if (chat.presences) { // receive presence updates -- composing, available, etc.
+            Object.values(chat.presences).forEach(presence => console.log( `${presence.name}'s presence is ${presence.lastKnownPresence} in ${chat.jid}`))
+        }
+        // only do something when a new message is received
+        if (!chat.hasNewMessage) return 
         
         const m = chat.messages.all()[0] // pull the new message from the update
         const messageStubType = WA_MESSAGE_STUB_TYPES[m.messageStubType] ||  'MESSAGE'

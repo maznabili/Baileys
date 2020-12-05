@@ -29,7 +29,7 @@ export class WAConnection extends Base {
         options: MessageOptions = {},
     ) {
         const waMessage = await this.prepareMessage (id, message, type, options)
-        await this.relayWAMessage (waMessage)
+        await this.relayWAMessage (waMessage, { waitForAck: options.waitForAck !== false })
         return waMessage
     }
     /** Prepares a message for sending via sendWAMessage () */
@@ -61,17 +61,17 @@ export class WAConnection extends Base {
                             message = await this.generateLinkPreview (message.text)
                         } catch { } // ignore if fails
                     }
-                    m.extendedTextMessage = WAMessageProto.ExtendedTextMessage.create(message as any)
+                    m.extendedTextMessage = WAMessageProto.ExtendedTextMessage.fromObject(message as any)
                 } else {
                     throw new BaileysError ('message needs to be a string or object with property \'text\'', message)
                 }
                 break
             case MessageType.location:
             case MessageType.liveLocation:
-                m.locationMessage = WAMessageProto.LocationMessage.create(message as any)
+                m.locationMessage = WAMessageProto.LocationMessage.fromObject(message as any)
                 break
             case MessageType.contact:
-                m.contactMessage = WAMessageProto.ContactMessage.create(message as any)
+                m.contactMessage = WAMessageProto.ContactMessage.fromObject(message as any)
                 break
             case MessageType.image:
             case MessageType.sticker:
@@ -81,7 +81,7 @@ export class WAConnection extends Base {
                 m = await this.prepareMessageMedia(message as Buffer, type, options)
                 break
         }
-        return WAMessageProto.Message.create (m)
+        return WAMessageProto.Message.fromObject (m)
     }
     /** Prepare a media message for sending */
     async prepareMessageMedia(buffer: Buffer, mediaType: MessageType, options: MessageOptions = {}) {
@@ -152,7 +152,7 @@ export class WAConnection extends Base {
         if (!mediaUrl) throw new Error('Media upload failed on all hosts')
 
         const message = {
-            [mediaType]: MessageTypeProto[mediaType].create (
+            [mediaType]: MessageTypeProto[mediaType].fromObject (
                 {
                     url: mediaUrl,
                     mediaKey: mediaKey,
@@ -168,7 +168,7 @@ export class WAConnection extends Base {
                 }
             )
         }   
-        return WAMessageProto.Message.create(message)// as WAMessageContent
+        return WAMessageProto.Message.fromObject(message)// as WAMessageContent
     }
     /** prepares a WAMessage for sending from the given content & options */
     prepareMessageFromContent(id: string, message: WAMessageContent, options: MessageOptions) {
@@ -200,7 +200,7 @@ export class WAConnection extends Base {
         if (options?.thumbnail) {
             message[key].jpegThumbnail = Buffer.from(options.thumbnail, 'base64')
         }
-        message = WAMessageProto.Message.create (message)
+        message = WAMessageProto.Message.fromObject (message)
 
         const messageJSON = {
             key: {
@@ -214,15 +214,29 @@ export class WAConnection extends Base {
             participant: id.includes('@g.us') ? this.user.jid : null,
             status: WA_MESSAGE_STATUS_TYPE.PENDING
         }
-        return WAMessageProto.WebMessageInfo.create (messageJSON)
+        return WAMessageProto.WebMessageInfo.fromObject (messageJSON)
     }
     /** Relay (send) a WAMessage; more advanced functionality to send a built WA Message, you may want to stick with sendMessage() */
-    async relayWAMessage(message: WAMessage) {
+    async relayWAMessage(message: WAMessage, { waitForAck } = { waitForAck: true }) {
         const json = ['action', {epoch: this.msgCount.toString(), type: 'relay'}, [['message', null, message]]]
         const flag = message.key.remoteJid === this.user?.jid ? WAFlag.acknowledge : WAFlag.ignore // acknowledge when sending message to oneself
-        await this.query({json, binaryTags: [WAMetric.message, flag], tag: message.key.id, expect200: true})
-        
-        message.status = WA_MESSAGE_STATUS_TYPE.SERVER_ACK
+        const mID = message.key.id
+        message.status = WA_MESSAGE_STATUS_TYPE.PENDING
+        const promise = this.query({
+            json, 
+            binaryTags: [WAMetric.message, flag], 
+            tag: mID, 
+            expect200: true
+        })
+        .then(() => message.status = WA_MESSAGE_STATUS_TYPE.SERVER_ACK)
+
+        if (waitForAck) {
+            await promise
+        } else {
+            promise
+            .then(() => this.emit('message-status-update', { ids: [ mID ], to: message.key.remoteJid, type: WA_MESSAGE_STATUS_TYPE.SERVER_ACK }))
+            .catch(() => this.emit('message-status-update', { ids: [ mID ], to: message.key.remoteJid, type: WA_MESSAGE_STATUS_TYPE.ERROR }))
+        }
         await this.chatAddMessageAppropriate (message)
     }
     /**
@@ -245,14 +259,18 @@ export class WAConnection extends Base {
      */
     @Mutex (message => message?.key?.id)
     async downloadMediaMessage (message: WAMessage) {
+        let mContent = message.message?.ephemeralMessage?.message || message.message
+        if (!mContent) throw new BaileysError('No message present', { status: 400 })
+        
         try {
-            const buff = await decodeMediaMessageBuffer (message.message, this.fetchRequest)
+            const buff = await decodeMediaMessageBuffer (mContent, this.fetchRequest)
             return buff
         } catch (error) {
             if (error instanceof BaileysError && error.status === 404) { // media needs to be updated
                 this.logger.info (`updating media of message: ${message.key.id}`)
                 await this.updateMediaMessage (message)
-                const buff = await decodeMediaMessageBuffer (message.message, this.fetchRequest)
+                mContent = message.message?.ephemeralMessage?.message || message.message
+                const buff = await decodeMediaMessageBuffer (mContent, this.fetchRequest)
                 return buff
             }
             throw error

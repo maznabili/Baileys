@@ -144,7 +144,7 @@ export class WAConnection extends Base {
      * @param chunkSize the number of messages to load in a single request
      * @param mostRecentFirst retreive the most recent message first or retreive from the converation start
      */
-    loadAllMessages(jid: string, onMessage: (m: WAMessage) => void, chunkSize = 25, mostRecentFirst = true) {
+    loadAllMessages(jid: string, onMessage: (m: WAMessage) => Promise<void>|void, chunkSize = 25, mostRecentFirst = true) {
         let offsetID = null
         const loadMessage = async () => {
             const {messages} = await this.loadMessages(jid, chunkSize, offsetID, mostRecentFirst)
@@ -152,12 +152,12 @@ export class WAConnection extends Base {
             let lastMessage
             if (mostRecentFirst) {
                 for (let i = messages.length - 1; i >= 0; i--) {
-                    onMessage(messages[i])
+                    await onMessage(messages[i])
                     lastMessage = messages[i]
                 }
             } else {
                 for (let i = 0; i < messages.length; i++) {
-                    onMessage(messages[i])
+                    await onMessage(messages[i])
                     lastMessage = messages[i]
                 }
             }
@@ -291,7 +291,7 @@ export class WAConnection extends Base {
         const json: WAMessageContent = {
             protocolMessage: {
                 key: messageKey,
-                type: WAMessageProto.ProtocolMessage.PROTOCOL_MESSAGE_TYPE.REVOKE
+                type: WAMessageProto.ProtocolMessage.ProtocolMessageType.REVOKE
             }
         }
         const waMessage = this.prepareMessageFromContent (id, json, {})
@@ -299,14 +299,14 @@ export class WAConnection extends Base {
         return waMessage
     }
     /**
-     * Forward a message like WA does
-     * @param id the id to forward the message to
+     * Generate forwarded message content like WA does
      * @param message the message to forward
      * @param forceForward will show the message as forwarded even if it is from you
      */
-    async forwardMessage(id: string, message: WAMessage, forceForward: boolean=false) {
-        const content = message.message
-        if (!content) throw new Error ('no content in message')
+    generateForwardMessageContent (message: WAMessage, forceForward: boolean=false) {
+        let content = message.message
+        if (!content) throw new BaileysError ('no content in message', { status: 400 })
+        content = JSON.parse(JSON.stringify(content)) // hacky copy
 
         let key = Object.keys(content)[0]
 
@@ -320,20 +320,34 @@ export class WAConnection extends Base {
         }
         if (score > 0) content[key].contextInfo = { forwardingScore: score, isForwarded: true }
         else content[key].contextInfo = {}
-
-        const waMessage = this.prepareMessageFromContent (id, content, {})
+        return content
+    }
+    /**
+     * Forward a message like WA
+     * @param jid the chat ID to forward to
+     * @param message the message to forward
+     * @param forceForward will show the message as forwarded even if it is from you
+     */
+    async forwardMessage(jid: string, message: WAMessage, forceForward: boolean=false) {
+        const content = this.generateForwardMessageContent(message, forceForward)
+        const waMessage = this.prepareMessageFromContent (jid, content, {})
         await this.relayWAMessage (waMessage)
         return waMessage
     }
-
-
+    /** 
+     * Delete the chat of a given ID 
+     * @deprecated -- use `modifyChat(jid, 'delete')` instead
+     * */
+    deleteChat (jid: string) {
+        return this.modifyChat(jid, 'delete')
+    }
     /**
      * Modify a given chat (archive, pin etc.)
      * @param jid the ID of the person/group you are modifiying
      * @param durationMs only for muting, how long to mute the chat for
      */
     @Mutex ((jid, type) => jid+type)
-    async modifyChat (jid: string, type: ChatModification, durationMs?: number) {
+    async modifyChat (jid: string, type: ChatModification | (keyof typeof ChatModification), durationMs?: number) {
         jid = whatsappID (jid)
         const chat = this.assertChatGet (jid)
 
@@ -366,7 +380,7 @@ export class WAConnection extends Base {
                     chatAttrs.owner = msg.key.fromMe.toString()
                 }
                 if (isGroupID(jid)) {
-                    chatAttrs.participant = this.user?.jid
+                    chatAttrs.participant = whatsappID(msg.participant || msg.key.participant)
                 }
                 break
         }
