@@ -1,6 +1,6 @@
 import * as QR from 'qrcode-terminal'
 import { WAConnection as Base } from './3.Connect'
-import { WAMessageStatusUpdate, WAMessage, WAContact, WAChat, WAMessageProto, WA_MESSAGE_STUB_TYPE, WA_MESSAGE_STATUS_TYPE, PresenceUpdate, BaileysEvent, DisconnectReason, WAOpenResult, Presence, AuthenticationCredentials, WAParticipantAction, WAGroupMetadata, WAUser, WANode, WAPresenceData, WAChatUpdate } from './Constants'
+import { WAMessageStatusUpdate, WAMessage, WAContact, WAChat, WAMessageProto, WA_MESSAGE_STUB_TYPE, WA_MESSAGE_STATUS_TYPE, PresenceUpdate, BaileysEvent, DisconnectReason, WAOpenResult, Presence, AuthenticationCredentials, WAParticipantAction, WAGroupMetadata, WAUser, WANode, WAPresenceData, WAChatUpdate, BlocklistUpdate } from './Constants'
 import { whatsappID, unixTimestampSeconds, isGroupID, GET_MESSAGE_ID, WA_MESSAGE_ID, waMessageKey, newMessagesDB, shallowChanges, toNumber } from './Utils'
 import KeyedDB from '@adiwajshing/keyed-db'
 import { Mutex } from './Mutex'
@@ -29,7 +29,7 @@ export class WAConnection extends Base {
                 chat.count = +chat.count
                 chat.messages = newMessagesDB()
                 // chats data (log json to see what it looks like)
-                !chats.get (chat.jid) && chats.insert (chat) 
+                chats.insert(chat) 
             })
             this.logger.info (`received ${json[2].length} chats`)
 
@@ -47,7 +47,7 @@ export class WAConnection extends Base {
                 } else {
                     chat.messages = oldChat.messages
                     if (oldChat.t !== chat.t || oldChat.modify_tag !== chat.modify_tag) {
-                        const changes = shallowChanges (oldChat, chat)
+                        const changes = shallowChanges (oldChat, chat, { lookForDeletedKeys: true })
                         delete chat.metadata // remove group metadata as that may have changed; TODO, write better mechanism for this
                         delete changes.messages
 
@@ -64,8 +64,15 @@ export class WAConnection extends Base {
         })
         // we store these last messages
         const lastMessages = {}
+        // keep track of overlaps, 
+        // if there are no overlaps of messages and we had messages present, we clear the previous messages
+        // this prevents missing messages in conversations
+        let overlaps: { [_: string]: { requiresOverlap: boolean, didOverlap?: boolean } } = {}
         // messages received
-        const messagesUpdate = (json, style: 'prepend' | 'append') => {
+        const messagesUpdate = (json, style: 'previous' | 'last') => {
+            if (style === 'last') {
+                overlaps = {}
+            }
             const isLast = json[1].last
             const messages = json[2] as WANode[]
             if (messages) {
@@ -73,22 +80,28 @@ export class WAConnection extends Base {
                 messages.reverse().forEach (([,, message]: ['message', null, WAMessage]) => {
                     const jid = message.key.remoteJid
                     const chat = this.chats.get(jid)
+                    
                     const mKeyID = WA_MESSAGE_ID(message)
-                    if (chat && !chat.messages.get(mKeyID)) {
-                        if (style === 'prepend') {
+                    if (chat) {
+                        if (style === 'previous') {
                             const fm = chat.messages.get(lastMessages[jid])
                             if (!fm) return
                             const prevEpoch = fm['epoch']
                             message['epoch'] = prevEpoch-1
-                        } else if (style === 'append') {
+                        } else if (style === 'last') {
+                            // no overlap required, if there were no previous messages
+                            overlaps[jid] = { requiresOverlap: chat.messages.length > 0 }
+                            
                             const lm = chat.messages.all()[chat.messages.length-1]
                             const prevEpoch = (lm && lm['epoch']) || 0
-                            message['epoch'] = prevEpoch+100 // hacky way to allow more previous messages
+                            // hacky way to allow more previous messages
+                            message['epoch'] = prevEpoch+1000 
                         }
-                        chat.messages.insert (message)
-                        
+                        if (chat.messages.upsert(message).length > 0) {
+                            overlaps[jid] = { ...(overlaps[jid] || { requiresOverlap: true }), didOverlap: true }
+                        }                        
                         updates[jid] = updates[jid] || newMessagesDB()
-                        updates[jid].insert(message)
+                        updates[jid].upsert(message)
 
                         lastMessages[jid] = mKeyID
                     } else if (!chat) this.logger.debug({ jid }, `chat not found`)
@@ -100,23 +113,47 @@ export class WAConnection extends Base {
                 }
             }
             if (isLast) {
-                this.emit('chats-received', { hasReceivedLastMessage: true })
+                // find which chats had missing messages
+                // list out all the jids, and how many messages we've cached now
+                const chatsWithMissingMessages = Object.keys(overlaps).map(jid => {
+                    // if there was no overlap, delete previous messages
+                    if (!overlaps[jid].didOverlap && overlaps[jid].requiresOverlap) {
+                        this.logger.debug(`received messages for ${jid}, but did not overlap with previous messages, clearing...`)
+                        const chat = this.chats.get(jid)
+                        if (chat) {
+                            const message = chat.messages.get(lastMessages[jid])
+                            const remainingMessages = chat.messages.paginatedByValue(message, this.maxCachedMessages, undefined, 'after')
+                            chat.messages = newMessagesDB([message, ...remainingMessages])
+                            return { jid, count: chat.messages.length } // return number of messages we've left
+                        }
+                    }
+                }).filter(Boolean)
+                this.emit('chats-received', { hasReceivedLastMessage: true, chatsWithMissingMessages })
             }
         }
-        this.on('CB:action,add:last', json =>  messagesUpdate(json, 'append'))
-        this.on('CB:action,add:before', json => messagesUpdate(json, 'prepend'))
-        this.on('CB:action,add:unread', json => messagesUpdate(json, 'prepend'))
+        this.on('CB:action,add:last', json =>  messagesUpdate(json, 'last'))
+        this.on('CB:action,add:before', json => messagesUpdate(json, 'previous'))
+        this.on('CB:action,add:unread', json => messagesUpdate(json, 'previous'))
 
         // contacts received
         this.on('CB:response,type:contacts', json => {
             if (json[1].duplicate || !json[2]) return
-            const contacts: { [_: string]: WAContact } = {}
+            const contacts = this.contacts
+            const updatedContacts: WAContact[] = []
             
             json[2].forEach(([type, contact]: ['user', WAContact]) => {
                 if (!contact) return this.logger.info (`unexpectedly got null contact: ${type}`, contact)
                 
                 contact.jid = whatsappID (contact.jid)
-                contacts[contact.jid] = contact
+                const presentContact = contacts[contact.jid]
+                if (presentContact) {
+                    const changes = shallowChanges(presentContact, contact, { lookForDeletedKeys: false })
+                    if (changes && Object.keys(changes).length > 0) {
+                        updatedContacts.push({ ...changes, jid: contact.jid })
+                    }
+                } else updatedContacts.push(contact)
+
+                contacts[contact.jid] = { ...(presentContact || {}), ...contact }
             })
             // update chat names
             const updatedChats = []
@@ -134,7 +171,7 @@ export class WAConnection extends Base {
             this.logger.info (`received ${json[2].length} contacts`)
             this.contacts = contacts
 
-            this.emit('contacts-received')
+            this.emit('contacts-received', { updatedContacts })
         })
         
         // new messages
@@ -180,13 +217,12 @@ export class WAConnection extends Base {
             const oldMessage = chat.messages.get (WA_MESSAGE_ID(message))
             if (oldMessage) {
                 message['epoch'] = oldMessage['epoch']
-                chat.messages.delete (oldMessage)
-                chat.messages.insert (message)
-
-                const chatUpdate: Partial<WAChat> = { jid, messages: newMessagesDB([ message ]) }
-                this.emit ('chat-update', chatUpdate)
-                // emit deprecated
-                this.emit ('message-update', message)
+                if (chat.messages.upsert(message).length) {
+                    const chatUpdate: Partial<WAChat> = { jid, messages: newMessagesDB([ message ]) }
+                    this.emit ('chat-update', chatUpdate)
+                    // emit deprecated
+                    this.emit ('message-update', message)
+                }
             } else {
                 this.logger.debug ({ unhandled: true }, 'received message update for non-present message from ' + jid)
             }
@@ -251,7 +287,7 @@ export class WAConnection extends Base {
         // profile picture updates
         this.on('CB:Cmd,type:picture', async json => {
             const jid = whatsappID(json[1].jid)
-            const imgUrl = await this.getProfilePicture(jid)
+            const imgUrl = await this.getProfilePicture(jid).catch(() => '')
             const contact = this.contacts[jid]
             if (contact) contact.imgUrl = imgUrl
             
@@ -312,6 +348,21 @@ export class WAConnection extends Base {
         this.on('CB:MsgInfo', func)
         
         this.on ('qr', qr => QR.generate(qr, { small: true }))
+
+        // blocklist updates
+        this.on('CB:Blocklist', json => {
+            if (!json) return
+            json = json[1]
+            const initial = this.blocklist
+            this.blocklist = json.blocklist
+
+            const added = this.blocklist.filter(id => !initial.includes(id))
+            const removed = initial.filter(id => !this.blocklist.includes(id))
+
+            const update: BlocklistUpdate = { added, removed }
+
+            this.emit('blocklist-update', update)
+        })
     }
     /** Get the URL to download the profile picture of a person/group */
     @Mutex (jid => jid)
@@ -331,7 +382,7 @@ export class WAConnection extends Base {
             
             const presence = { ...(chat.presences[jid] || {}) } as WAPresenceData 
             if (update.t) presence.lastSeen = +update.t
-            else if (update.type === Presence.unavailable && presence.lastKnownPresence !== Presence.unavailable) {
+            else if (update.type === Presence.unavailable && (presence.lastKnownPresence === Presence.available || presence.lastKnownPresence === Presence.composing)) {
                 presence.lastSeen = unixTimestampSeconds()
             }
             presence.lastKnownPresence = update.type
@@ -353,26 +404,29 @@ export class WAConnection extends Base {
         this.chatUpdatedMessage (update.ids, update.type, chat)
     }
     /** inserts an empty chat into the DB */
-    protected async chatAdd (jid: string, name?: string) {
-        if (this.chats.get (jid)) return
-        
+    protected async chatAdd (jid: string, name?: string) {        
         const chat: WAChat = {
-            jid: jid,
+            jid,
+            name,
             t: unixTimestampSeconds(),
-            messages: new KeyedDB(waMessageKey, WA_MESSAGE_ID),
+            messages: newMessagesDB(),
             count: 0,
             modify_tag: '',
-            spam: 'false',
-            name
+            spam: 'false'
         }
 
-        this.chats.insert (chat)
-        if (this.loadProfilePicturesForChatsAutomatically) {
-            await this.setProfilePicture (chat)
-        }
-        
-        this.emit ('chat-new', chat)
-        return chat
+        if(this.chats.insertIfAbsent (chat).length) {
+            if (this.loadProfilePicturesForChatsAutomatically) {
+                await this.setProfilePicture (chat)
+            }
+            this.emit ('chat-new', chat)
+            return chat
+        }   
+    }
+    protected contactAddOrGet (jid: string) {
+        jid = whatsappID(jid)
+        if (!this.contacts[jid]) this.contacts[jid] = { jid }
+        return this.contacts[jid]
     }
     /** find a chat or return an error */
     protected assertChatGet = jid => {
@@ -400,6 +454,23 @@ export class WAConnection extends Base {
             if (contact?.lastKnownPresence === Presence.composing) { // update presence
                 const update = this.applyingPresenceUpdate({ id: chat.jid, participant, type: Presence.available })
                 update && Object.assign(chatUpdate, update)
+            }
+        }
+        
+        const ephemeralProtocolMsg = message.message?.ephemeralMessage?.message?.protocolMessage
+        if (
+            ephemeralProtocolMsg && 
+            ephemeralProtocolMsg.type === WAMessageProto.ProtocolMessage.ProtocolMessageType.EPHEMERAL_SETTING
+        ) {
+            chatUpdate.eph_setting_ts = message.messageTimestamp.toString()
+            chatUpdate.ephemeral = ephemeralProtocolMsg.ephemeralExpiration.toString()
+            
+            if (ephemeralProtocolMsg.ephemeralExpiration) {
+                chat.eph_setting_ts = chatUpdate.eph_setting_ts
+                chat.ephemeral = chatUpdate.ephemeral
+            } else {
+                delete chat.eph_setting_ts
+                delete chat.ephemeral
             }
         }
 
@@ -430,12 +501,11 @@ export class WAConnection extends Base {
             message['epoch'] = lastEpoch+1
 
             messages.insert (message)
-
             while (messages.length > this.maxCachedMessages) {
                 messages.delete (messages.all()[0]) // delete oldest messages
             }            
             // only update if it's an actual message
-            if (message.message) {
+            if (message.message && !ephemeralProtocolMsg) {
                 this.chatUpdateTime (chat, +toNumber(message.messageTimestamp))
                 chatUpdate.t = chat.t
             }
@@ -443,7 +513,6 @@ export class WAConnection extends Base {
             chatUpdate.messages = newMessagesDB([ message ])
             // emit deprecated
             this.emit('message-new', message)
-
             // check if the message is an action 
             if (message.messageStubType) {
                 const jid = chat.jid
@@ -479,7 +548,7 @@ export class WAConnection extends Base {
                         const announce = message.messageStubParameters[0] === 'on' ? 'true' : 'false'
                         emitGroupUpdate({ announce })
                         break
-                    case WA_MESSAGE_STUB_TYPE.GROUP_CHANGE_ANNOUNCE:
+                    case WA_MESSAGE_STUB_TYPE.GROUP_CHANGE_RESTRICT:
                         const restrict = message.messageStubParameters[0] === 'on' ? 'true' : 'false'
                         emitGroupUpdate({ restrict })
                         break
@@ -501,18 +570,18 @@ export class WAConnection extends Base {
         if (meta) {
             switch (action) {
                 case 'add':
-                    participants.forEach(id => (
-                        meta.participants.push({ id, isAdmin: false, isSuperAdmin: false })
+                    participants.forEach(jid => (
+                        meta.participants.push({ ...this.contactAddOrGet(jid), isAdmin: false, isSuperAdmin: false })
                     ))
                     break
                 case 'remove':
-                    meta.participants = meta.participants.filter(p => !participants.includes(whatsappID(p.id)))
+                    meta.participants = meta.participants.filter(p => !participants.includes(p.jid))
                     break
                 case 'promote':
                 case 'demote':
                     const isAdmin = action==='promote'
                     meta.participants.forEach(p => {
-                        if (participants.includes(whatsappID(p.id))) p.isAdmin = isAdmin
+                        if (participants.includes( p.jid )) p.isAdmin = isAdmin
                     })
                     break
             }
@@ -568,9 +637,9 @@ export class WAConnection extends Base {
     /** when a new chat is added */
     on (event: 'chat-new', listener: (chat: WAChat) => void): this
     /** when contacts are sent by WA */
-    on (event: 'contacts-received', listener: () => void): this
+    on (event: 'contacts-received', listener: (u: { updatedContacts: Partial<WAContact>[] }) => void): this
     /** when chats are sent by WA, and when all messages are received */
-    on (event: 'chats-received', listener: (update: {hasNewChats?: boolean, hasReceivedLastMessage?: boolean}) => void): this
+    on (event: 'chats-received', listener: (update: {hasNewChats?: boolean, hasReceivedLastMessage?: boolean, chatsWithMissingMessages: { jid: string, count: number }[] }) => void): this
     /** when multiple chats are updated (new message, updated message, deleted, pinned, etc) */
     on (event: 'chats-update', listener: (chats: WAChatUpdate[]) => void): this
     /** when a chat is updated (new message, updated message, deleted, pinned, presence updated etc) */
@@ -593,6 +662,8 @@ export class WAConnection extends Base {
     on (event: 'group-update', listener: (update: Partial<WAGroupMetadata> & {jid: string, actor?: string}) => void): this
     /** when WA sends back a pong */
     on (event: 'received-pong', listener: () => void): this
+    /** when a user is blocked or unblockd */
+    on (event: 'blocklist-update', listener: (update: BlocklistUpdate) => void): this
 
     on (event: BaileysEvent | string, listener: (json: any) => void): this
 

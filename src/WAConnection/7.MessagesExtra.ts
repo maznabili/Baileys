@@ -1,6 +1,6 @@
 import {WAConnection as Base} from './6.MessagesSend'
-import { MessageType, WAMessageKey, MessageInfo, WAMessageContent, WAMetric, WAFlag, WANode, WAMessage, WAMessageProto, ChatModification, BaileysError } from './Constants'
-import { whatsappID, delay, toNumber, unixTimestampSeconds, GET_MESSAGE_ID, WA_MESSAGE_ID, isGroupID } from './Utils'
+import { MessageType, WAMessageKey, MessageInfo, WAMessageContent, WAMetric, WAFlag, WANode, WAMessage, WAMessageProto, ChatModification, BaileysError, WAChatIndex, WAChat } from './Constants'
+import { whatsappID, delay, toNumber, unixTimestampSeconds, GET_MESSAGE_ID, WA_MESSAGE_ID, isGroupID, newMessagesDB } from './Utils'
 import { Mutex } from './Mutex'
 
 export class WAConnection extends Base {
@@ -19,7 +19,12 @@ export class WAConnection extends Base {
     @Mutex ((jid, messageID) => jid+messageID)
     async messageInfo (jid: string, messageID: string) {
         const query = ['query', {type: 'message_info', index: messageID, jid: jid, epoch: this.msgCount.toString()}, null]
-        const response = (await this.query ({json: query, binaryTags: [22, WAFlag.ignore], expect200: true}))[2]
+        const [,,response] = await this.query ({
+            json: query, 
+            binaryTags: [WAMetric.queryRead, WAFlag.ignore], 
+            expect200: true,
+            requiresPhoneConnection: true
+        })
 
         const info: MessageInfo = {reads: [], deliveries: []}
         if (response) {
@@ -44,10 +49,12 @@ export class WAConnection extends Base {
         jid = whatsappID (jid)
         const chat = this.assertChatGet (jid)
 
-        const message = (await this.loadMessages(jid, 1)).messages[0]
-        const count = type === 'unread' ? -2 : Math.abs(chat.count)
+        const count = type === 'unread' ? '-2' : Math.abs(chat.count).toString()
         if (type === 'unread' || chat.count !== 0) {
-            await this.sendReadReceipt (jid, message.key, count)
+            const idx = await this.getChatIndex(jid)
+            await this.setQuery ([
+                ['read', { jid, count, ...idx, participant: undefined }, null]
+            ], [ WAMetric.read, WAFlag.ignore ])
         }
         chat.count = type === 'unread' ? -1 : 0
         this.emit ('chat-update', {jid, count: chat.count})
@@ -55,6 +62,7 @@ export class WAConnection extends Base {
     /**
      * Sends a read receipt for a given message;
      * does not update the chat do @see chatRead
+     * @deprecated just use chatRead()
      * @param jid the ID of the person/group whose message you want to mark read
      * @param messageKey the key of the message
      * @param count number of messages to read, set to < 0 to unread a message
@@ -84,7 +92,7 @@ export class WAConnection extends Base {
             },
             null,
         ]
-        const response = await this.query({json, binaryTags: [WAMetric.queryMessages, WAFlag.ignore], expect200: false})
+        const response = await this.query({json, binaryTags: [WAMetric.queryMessages, WAFlag.ignore], expect200: false, requiresPhoneConnection: true})
         return (response[2] as WANode[])?.map(item => item[2] as WAMessage) || []
     }
     /**
@@ -124,9 +132,9 @@ export class WAConnection extends Base {
                     const m = extra[i]
                     fepoch -= 1
                     m['epoch'] = fepoch
-                    
-                    if(chat.messages.length < this.maxCachedMessages && !chat.messages.get (WA_MESSAGE_ID(m))) {
-                        chat.messages.insert(m)
+
+                    if(chat.messages.length < this.maxCachedMessages) {
+                        chat.messages.insertIfAbsent(m)
                     }
                 }
                 messages.unshift (...extra)
@@ -283,18 +291,53 @@ export class WAConnection extends Base {
         return result
     }
     /**
+     * Star or unstar a message
+     * @param messageKey key of the message you want to star or unstar
+     */
+    @Mutex (m => m.remoteJid)
+    async starMessage (messageKey: WAMessageKey, type: 'star' | 'unstar' = 'star') { 
+        const attrs: WANode = [
+            'chat',
+            { 
+                jid: messageKey.remoteJid,
+                type
+            },
+            [
+                ['item', {owner: `${messageKey.fromMe}`, index: messageKey.id}, null]
+            ]
+        ]
+        const result = await this.setQuery ([attrs])
+
+        const chat = this.chats.get (whatsappID(messageKey.remoteJid))
+        if (result.status == 200 && chat) {
+            const message = chat.messages.get (GET_MESSAGE_ID(messageKey))
+            if (message) {
+                message.starred = type === 'star'
+
+                const chatUpdate: Partial<WAChat> = { jid: messageKey.remoteJid, messages: newMessagesDB([ message ]) }
+                this.emit ('chat-update', chatUpdate)
+                // emit deprecated
+                this.emit ('message-update', message)
+            }
+        }
+        return result
+    }
+    /**
      * Delete a message in a chat for everyone
      * @param id the person or group where you're trying to delete the message
      * @param messageKey key of the message you want to delete
      */
-    async deleteMessage (id: string, messageKey: WAMessageKey) {
+    async deleteMessage (k: string | WAMessageKey, messageKey?: WAMessageKey) {
+        if (typeof k === 'object') {
+            messageKey = k
+        }
         const json: WAMessageContent = {
             protocolMessage: {
                 key: messageKey,
                 type: WAMessageProto.ProtocolMessage.ProtocolMessageType.REVOKE
             }
         }
-        const waMessage = this.prepareMessageFromContent (id, json, {})
+        const waMessage = this.prepareMessageFromContent (messageKey.remoteJid, json, {})
         await this.relayWAMessage (waMessage)
         return waMessage
     }
@@ -342,24 +385,38 @@ export class WAConnection extends Base {
         return this.modifyChat(jid, 'delete')
     }
     /**
+     * Clear the chat messages
+     * @param jid the ID of the person/group you are modifiying
+     * @param includeStarred delete starred messages, default false
+     */
+    async modifyChat (jid: string, type: ChatModification.clear, includeStarred?: boolean): Promise<{status: number;}>;
+    /**
      * Modify a given chat (archive, pin etc.)
      * @param jid the ID of the person/group you are modifiying
      * @param durationMs only for muting, how long to mute the chat for
      */
+    async modifyChat (jid: string, type: ChatModification.pin | ChatModification.mute, durationMs: number): Promise<{status: number;}>;
+    /**
+     * Modify a given chat (archive, pin etc.)
+     * @param jid the ID of the person/group you are modifiying
+     */
+    async modifyChat (jid: string, type: ChatModification | (keyof typeof ChatModification)): Promise<{status: number;}>;
     @Mutex ((jid, type) => jid+type)
-    async modifyChat (jid: string, type: ChatModification | (keyof typeof ChatModification), durationMs?: number) {
+    async modifyChat (jid: string, type: (keyof typeof ChatModification), arg?: number | boolean): Promise<{status: number;}> {
         jid = whatsappID (jid)
         const chat = this.assertChatGet (jid)
 
         let chatAttrs: Record<string, string> = {jid: jid}
-        if (type === ChatModification.mute && !durationMs) {
+        if (type === ChatModification.mute && !arg) {
             throw new BaileysError(
                 'duration must be set to the timestamp of the time of pinning/unpinning of the chat', 
                 { status: 400 }
             )
         }
 
-        durationMs = durationMs || 0
+        const durationMs:number = arg as number || 0
+        const includeStarred:boolean = arg as boolean
+        let index: WAChatIndex;
         switch (type) {
             case ChatModification.pin:
             case ChatModification.mute:
@@ -372,22 +429,30 @@ export class WAConnection extends Base {
                 chatAttrs.type = type.replace ('un', '') // replace 'unpin' with 'pin'
                 chatAttrs.previous = chat[type.replace ('un', '')]
                 break
+            case ChatModification.clear:
+                chatAttrs.type = type
+                chatAttrs.star = includeStarred ? 'true' : 'false'
+                index = await this.getChatIndex(jid)
+                chatAttrs = { ...chatAttrs, ...index }
+                delete chatAttrs.participant
+                break
             default:
                 chatAttrs.type = type
-                const msg = (await this.loadMessages(jid, 1)).messages[0]
-                if (msg) {
-                    chatAttrs.index = msg.key.id
-                    chatAttrs.owner = msg.key.fromMe.toString()
-                }
-                if (isGroupID(jid)) {
-                    chatAttrs.participant = whatsappID(msg.participant || msg.key.participant)
-                }
+                index = await this.getChatIndex(jid)
+                chatAttrs = { ...chatAttrs, ...index }
                 break
         }
 
         const response = await this.setQuery ([['chat', chatAttrs, null]], [ WAMetric.chat, WAFlag.ignore ])
 
-        if (chat) {
+        if (chat && response.status === 200) {
+            if (type === ChatModification.clear) {
+                if (includeStarred) {
+                    chat.messages.clear ()
+                } else {
+                    chat.messages = chat.messages.filter(m => m.starred)
+                }
+            }
             if (type.includes('un')) {
                 type = type.replace ('un', '') as ChatModification
                 delete chat[type.replace('un','')]
@@ -398,5 +463,17 @@ export class WAConnection extends Base {
             }
         }
         return response
+    }
+    protected async getChatIndex (jid: string): Promise<WAChatIndex> {
+        const chatAttrs = {} as WAChatIndex
+        const { messages: [msg] } = await this.loadMessages(jid, 1)
+        if (msg) {
+            chatAttrs.index = msg.key.id
+            chatAttrs.owner = msg.key.fromMe.toString() as 'true' | 'false'
+        }
+        if (isGroupID(jid)) {
+            chatAttrs.participant = msg.key.fromMe ? this.user?.jid : whatsappID(msg.participant || msg.key.participant)
+        }
+        return chatAttrs
     }
 }

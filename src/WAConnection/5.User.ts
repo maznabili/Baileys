@@ -1,5 +1,5 @@
 import {WAConnection as Base} from './4.Events'
-import { Presence, WABroadcastListInfo, WAProfilePictureChange, WALoadChatOptions } from './Constants'
+import { Presence, WABroadcastListInfo, WAProfilePictureChange, WALoadChatOptions, WAChatIndex, BlocklistUpdate } from './Constants'
 import {
     WAMessage,
     WANode,
@@ -83,13 +83,13 @@ export class WAConnection extends Base {
     /** Get your contacts */
     async getContacts() {
         const json = ['query', { epoch: this.msgCount.toString(), type: 'contacts' }, null]
-        const response = await this.query({ json, binaryTags: [6, WAFlag.ignore], expect200: true }) // this has to be an encrypted query
+        const response = await this.query({ json, binaryTags: [WAMetric.queryContact, WAFlag.ignore], expect200: true, requiresPhoneConnection: true }) // this has to be an encrypted query
         return response
     }
     /** Get the stories of your contacts */
     async getStories() {
         const json = ['query', { epoch: this.msgCount.toString(), type: 'status' }, null]
-        const response = await this.query({json, binaryTags: [30, WAFlag.ignore], expect200: true }) as WANode
+        const response = await this.query({json, binaryTags: [WAMetric.queryStatus, WAFlag.ignore], expect200: true, requiresPhoneConnection: true }) as WANode
         if (Array.isArray(response[2])) {
             return response[2].map (row => (
                 { 
@@ -107,7 +107,13 @@ export class WAConnection extends Base {
         return this.query({ json, binaryTags: [5, WAFlag.ignore], expect200: true }) // this has to be an encrypted query
     }
     /** Query broadcast list info */
-    async getBroadcastListInfo(jid: string) { return this.query({json: ['query', 'contact', jid], expect200: true }) as Promise<WABroadcastListInfo> }
+    async getBroadcastListInfo(jid: string) { 
+        return this.query({
+            json: ['query', 'contact', jid], 
+            expect200: true, 
+            requiresPhoneConnection: true
+        }) as Promise<WABroadcastListInfo> 
+    }
     /**
      * Load chats in a paginated manner + gets the profile picture
      * @param before chats before the given cursor
@@ -158,5 +164,45 @@ export class WAConnection extends Base {
             this.emit ('chat-update', { jid, imgUrl: response.eurl })
         }
         return response
+    }
+    /**
+     * Add or remove user from blocklist
+     * @param jid the ID of the person who you are blocking/unblocking
+     * @param type type of operation
+     */
+    @Mutex (jid => jid)
+    async blockUser (jid: string, type: 'add' | 'remove' = 'add') {
+        jid.replace('@s.whatsapp.net', '@c.us')
+
+        const tag = this.generateMessageTag()
+        const json: WANode = [
+            'block',
+            {
+                type: type,
+            },
+            [
+                ['user', { jid }, null]
+            ],
+        ]
+        const result = await this.setQuery ([json], [WAMetric.block, WAFlag.ignore], tag)
+
+        if (result.status === 200) {
+            if (type === 'add') {
+                this.blocklist.push(jid)
+            } else {
+                const index = this.blocklist.indexOf(jid);
+                if (index !== -1) {
+                    this.blocklist.splice(index, 1);
+                }
+            }
+
+            // Blocklist update event
+            const update: BlocklistUpdate = { added: [], removed: [] }
+            let key = type === 'add' ? 'added' : 'removed'
+            update[key] = [ jid ]
+            this.emit('blocklist-update', update)
+        }
+
+        return result
     }
 }

@@ -49,7 +49,7 @@ export class WAConnection extends Base {
             else json.push ('takeover')
             // send login every 10s
             const sendLoginReq = () => {
-                if (this.conn?.readyState !== this.conn.OPEN) {
+                if (!this.conn || this.conn?.readyState !== this.conn.OPEN) {
                     this.logger.warn('Received login timeout req when WS not open, ignoring...')
                     return
                 }
@@ -87,7 +87,7 @@ export class WAConnection extends Base {
             response = await this.waitForMessage('s2', true)
         }
         
-        const newUser = await this.validateNewConnection(response[1]) // validate the connection
+        const newUser = this.validateNewConnection(response[1]) // validate the connection
         if (newUser.jid !== this.user?.jid) {
             isNewUser = true
             // clear out old data

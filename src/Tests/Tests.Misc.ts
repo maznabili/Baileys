@@ -1,10 +1,11 @@
-import { Presence, ChatModification, delay } from '../WAConnection/WAConnection'
+import { Presence, ChatModification, delay, newMessagesDB, WA_DEFAULT_EPHEMERAL, MessageType } from '../WAConnection/WAConnection'
 import { promises as fs } from 'fs'
 import * as assert from 'assert'
 import fetch from 'node-fetch'
-import { WAConnectionTest, testJid } from './Common'
+import { WAConnectionTest, testJid, assertChatDBIntegrity, sendAndRetreiveMessage } from './Common'
 
-WAConnectionTest('Misc', (conn) => {
+WAConnectionTest('Misc', conn => {
+
     it('should tell if someone has an account on WhatsApp', async () => {
         const response = await conn.isOnWhatsApp(testJid)
         assert.strictEqual(response, true)
@@ -24,7 +25,7 @@ WAConnectionTest('Misc', (conn) => {
                 if (jid === conn.user.jid) {
                     assert.strictEqual (status, newStatus)
                     conn.removeAllListeners ('user-status-update')
-                    resolve ()
+                    resolve(undefined)
                 }
             })
         })
@@ -78,7 +79,7 @@ WAConnectionTest('Misc', (conn) => {
                 conn.once ('chat-update', ({jid: tJid, count}) => {
                     if (jid === tJid) {
                         assert.ok (count < 0)
-                        resolve ()
+                        resolve(undefined)
                     }
                 })
             })
@@ -106,7 +107,7 @@ WAConnectionTest('Misc', (conn) => {
                 if (jid === testJid ) {
                     assert.ok (mute)
                     conn.removeAllListeners ('chat-update')
-                    resolve ()
+                    resolve(undefined)
                 }
             })
         })
@@ -114,6 +115,66 @@ WAConnectionTest('Misc', (conn) => {
         await waitForEvent
         await delay (2000)
         await conn.modifyChat (testJid, ChatModification.unmute)
+    })
+    it('should star/unchar messages', async () => {
+        for (let i = 1; i <= 5; i++) {
+          await conn.sendMessage(testJid, `Message ${i}`, MessageType.text)
+          await delay(1000)
+        }
+
+        let response = await conn.loadMessages(testJid, 5)
+        let starred = response.messages.filter(m => m.starred)
+        assert.strictEqual(starred.length, 0)
+    
+        conn.starMessage(response.messages[2].key)
+        await delay(2000)
+        conn.starMessage(response.messages[4].key)
+        await delay(2000)
+    
+        response = await conn.loadMessages(testJid, 5)
+        starred = response.messages.filter(m => m.starred)
+        assert.strictEqual(starred.length, 2)
+        await delay(2000)
+        
+        conn.starMessage(response.messages[2].key, 'unstar')
+        await delay(2000)
+
+        response = await conn.loadMessages(testJid, 5)
+        starred = response.messages.filter(m => m.starred)
+        assert.strictEqual(starred.length, 1)
+    })
+    it('should clear a chat', async () => {
+        // Uses chat with yourself to avoid losing chats
+        const selfJid = conn.user.jid
+
+        for (let i = 1; i <= 5; i++) {
+          await conn.sendMessage(selfJid, `Message ${i}`, MessageType.text)
+          await delay(1000)
+        }
+
+        let response = await conn.loadMessages(selfJid, 50)
+        const initialCount = response.messages.length
+
+        assert.ok(response.messages.length >= 0)
+    
+        conn.starMessage(response.messages[2].key)
+        await delay(2000)
+        conn.starMessage(response.messages[4].key)
+        await delay(2000)
+    
+        await conn.modifyChat(selfJid, ChatModification.clear)
+        await delay(2000)
+    
+        response = await conn.loadMessages(selfJid, 50)
+        await delay(2000)
+        assert.ok(response.messages.length < initialCount)
+        assert.ok(response.messages.length > 1)
+    
+        await conn.modifyChat(selfJid, ChatModification.clear, true)
+        await delay(2000)
+    
+        response = await conn.loadMessages(selfJid, 50)
+        assert.strictEqual(response.messages.length, 1)
     })
     it('should return search results', async () => {
         const jids = [null, testJid]
@@ -155,5 +216,132 @@ WAConnectionTest('Misc', (conn) => {
         await assert.rejects (
             conn.generateLinkPreview ('I sent links to https://teachyourselfcs.com/ and https://www.fast.ai/')
         )
+    })
+    // this test requires quite a few messages with the test JID
+    it('should detect overlaps and clear messages accordingly', async () => {
+        // wait for chats
+        await new Promise(resolve => (
+            conn.once('chats-received', ({ hasReceivedLastMessage }) => hasReceivedLastMessage && resolve(undefined))
+        ))
+
+        conn.maxCachedMessages = 100
+
+        const chat = conn.chats.get(testJid)
+        const oldCount = chat.messages.length
+        console.log(`test chat has ${oldCount} pre-loaded messages`)
+        // load 100 messages
+        await conn.loadMessages(testJid, 100, undefined)
+        assert.strictEqual(chat.messages.length, 100)
+        
+        conn.close()
+        // remove all latest messages
+        chat.messages = newMessagesDB( chat.messages.all().slice(0, 20) )
+
+        const task = new Promise(resolve => (
+            conn.on('chats-received', ({ hasReceivedLastMessage, chatsWithMissingMessages }) => {
+                if (hasReceivedLastMessage) {
+                    assert.strictEqual(Object.keys(chatsWithMissingMessages).length, 1)
+                    const missing = chatsWithMissingMessages.find(({ jid }) => jid === testJid)
+                    assert.ok(missing, 'missing message not detected')
+                    assert.strictEqual(
+                        conn.chats.get(testJid).messages.length,
+                        missing.count
+                    )
+                    assert.strictEqual(missing.count, oldCount)
+                    resolve(undefined)
+                }
+            })
+        ))
+
+        await conn.connect()
+
+        await task
+    })
+
+    it('should toggle disappearing messages', async () => {
+        let chat = conn.chats.get(testJid)
+        if (!chat) {
+            // wait for chats
+            await new Promise(resolve => (
+                conn.once('chats-received', resolve)
+            ))
+            chat = conn.chats.get(testJid)
+        }
+        
+        const waitForChatUpdate = (ephemeralOn: boolean) => (
+            new Promise(resolve => (
+                conn.on('chat-update', ({ jid, ephemeral }) => {
+                    if (jid === testJid && typeof ephemeral !== 'undefined') {
+                        assert.strictEqual(!!(+ephemeral), ephemeralOn)
+                        assert.strictEqual(!!(+chat.ephemeral), ephemeralOn)
+                        resolve(undefined)
+                        conn.removeAllListeners('chat-update')
+                    }
+                })
+            ))
+        )
+        const toggleDisappearingMessages = async (on: boolean) => {
+            const update = waitForChatUpdate(on)
+            await conn.toggleDisappearingMessages(testJid, on ? WA_DEFAULT_EPHEMERAL : 0)
+            await update
+        }
+        
+        if (!chat.eph_setting_ts) {
+            await toggleDisappearingMessages(true)
+        }
+
+        await delay(1000)
+
+        let msg = await sendAndRetreiveMessage(
+            conn,
+            'This will go poof 😱',
+            MessageType.text
+        )
+        assert.ok(msg.message?.ephemeralMessage)
+        
+        const contextInfo = msg.message?.ephemeralMessage?.message?.extendedTextMessage?.contextInfo
+        assert.strictEqual(contextInfo.expiration, chat.ephemeral)
+        assert.strictEqual(+contextInfo.ephemeralSettingTimestamp, +chat.eph_setting_ts)
+        // test message deletion
+        await conn.deleteMessage(testJid, msg.key)
+        
+        await delay(1000)
+
+        await toggleDisappearingMessages(false)
+
+        await delay(1000)
+
+        msg = await sendAndRetreiveMessage(
+            conn,
+            'This will not go poof 😔',
+            MessageType.text
+        )
+        assert.ok(msg.message.extendedTextMessage)
+    })
+    it('should block & unblock a user', async () => {
+        const blockedCount = conn.blocklist.length;
+
+        const waitForEventAdded = new Promise<void> (resolve => {
+            conn.once ('blocklist-update', ({added}) => {
+                assert.ok (added.length)
+                resolve ()
+            })
+        })
+
+        await conn.blockUser (testJid, 'add')
+        assert.strictEqual(conn.blocklist.length, blockedCount + 1);
+        await waitForEventAdded
+
+        await delay (2000)
+        const waitForEventRemoved = new Promise<void> (resolve => {
+            conn.once ('blocklist-update', ({removed}) => {
+                assert.ok (removed.length)
+                resolve ()
+            })
+        })
+
+        await conn.blockUser (testJid, 'remove')
+        assert.strictEqual(conn.blocklist.length, blockedCount);
+        await waitForEventRemoved
     })
 })

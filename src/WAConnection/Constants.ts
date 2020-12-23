@@ -7,6 +7,7 @@ export const WS_URL = 'wss://web.whatsapp.com/ws'
 export const DEFAULT_ORIGIN = 'https://web.whatsapp.com'
 
 export const KEEP_ALIVE_INTERVAL_MS = 20*1000
+export const WA_DEFAULT_EPHEMERAL = 7*24*60*60
 
 // export the WAMessage Prototypes
 export { proto as WAMessageProto }
@@ -168,6 +169,7 @@ export interface WAGroupCreateResponse {
     gid?: string
     participants?: [{ [key: string]: any }]
 }
+export type WAGroupParticipant = (WAContact & { isAdmin: boolean; isSuperAdmin: boolean })
 export interface WAGroupMetadata {
     id: string
     owner: string
@@ -180,7 +182,8 @@ export interface WAGroupMetadata {
     restrict?: 'true' | 'false' 
     /** is set when the group only allows admins to write messages */
     announce?: 'true' | 'false' 
-    participants: { id: string; isAdmin: boolean; isSuperAdmin: boolean }[]
+    // Baileys modified array
+    participants: WAGroupParticipant[]
 }
 export interface WAGroupModification {
     status: number
@@ -216,12 +219,17 @@ export interface WAChat {
     /** number of unread messages, is < 0 if the chat is manually marked unread */
     count: number
     archive?: 'true' | 'false'
+    clear?: 'true' | 'false'
     read_only?: 'true' | 'false'
     mute?: string
     pin?: string
     spam: 'false' | 'true'
     modify_tag: string
     name?: string
+    /** when ephemeral messages were toggled on */
+    eph_setting_ts?: string
+    /** how long each message lasts for */
+    ephemeral?: string
     
     // Baileys added properties
     messages: KeyedDB<WAMessage, string>
@@ -229,6 +237,7 @@ export interface WAChat {
     presences?: { [k: string]: WAPresenceData }
     metadata?: WAGroupMetadata
 }
+export type WAChatIndex = { index: string, owner: 'true' | 'false', participant?: string }
 export type WAChatUpdate = Partial<WAChat> & { jid: string, hasNewMessage?: boolean }
 export enum WAMetric {
     debugLog = 1,
@@ -252,6 +261,7 @@ export enum WAMetric {
     queryGroup = 19,
     queryPreview = 20,
     queryEmoji = 21,
+    queryRead = 22,
     queryVCard = 29,
     queryStatus = 30,
     queryStatusUpdate = 31,
@@ -312,7 +322,8 @@ export enum ChatModification {
     unpin='unpin',
     mute='mute',
     unmute='unmute',
-    delete='delete'
+    delete='delete',
+    clear='clear'
 }
 export const HKDFInfoKeys = {
     [MessageType.image]: 'WhatsApp Image Keys',
@@ -363,6 +374,9 @@ export interface MessageOptions {
     forceNewMediaOptions?: boolean
     /** Wait for the message to be sent to the server (default true) */
     waitForAck?: boolean
+    /** Should it send as a disappearing messages. 
+     * By default 'chat' -- which follows the setting of the chat */
+    sendEphemeral?: 'chat' | boolean
 }
 export interface WABroadcastListInfo {
     status: number
@@ -416,6 +430,10 @@ export interface PresenceUpdate {
     type?: Presence
     deny?: boolean
 }
+export interface BlocklistUpdate {
+    added: string[]
+    removed: string[]
+}
 // path to upload the media
 export const MediaPathMap = {
     imageMessage: '/mms/image',
@@ -455,4 +473,5 @@ export type BaileysEvent =
     'group-update' |
     'received-pong' |
     'credentials-updated' |
-    'connection-validated'
+    'connection-validated' |
+    'blocklist-update'

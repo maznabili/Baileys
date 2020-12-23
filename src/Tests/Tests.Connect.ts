@@ -1,6 +1,6 @@
 import * as assert from 'assert'
 import {WAConnection} from '../WAConnection/WAConnection'
-import { AuthenticationCredentialsBase64, BaileysError, ReconnectMode, DisconnectReason, WAChat } from '../WAConnection/Constants'
+import { AuthenticationCredentialsBase64, BaileysError, ReconnectMode, DisconnectReason, WAChat, WAContact } from '../WAConnection/Constants'
 import { delay } from '../WAConnection/Utils'
 import { assertChatDBIntegrity, makeConnection, testJid } from './Common'
 
@@ -79,7 +79,7 @@ describe('Test Connect', () => {
                 conn.on ('connection-phone-change', ({connected}) => {
                     if (connected === expect) {
                         conn.removeAllListeners ('connection-phone-change')
-                        resolve ()
+                        resolve(undefined)
                     }
                 })
             })
@@ -234,7 +234,7 @@ describe ('Reconnects', () => {
                     if (closes >= 1) {
                         conn.removeAllListeners ('close')
                         conn.removeAllListeners ('connecting')
-                        resolve ()
+                        resolve(undefined)
                     }
                 })
                 conn.on ('connecting', () => {
@@ -249,7 +249,7 @@ describe ('Reconnects', () => {
             await new Promise (resolve => {
                 conn.on ('open', () => {
                     conn.removeAllListeners ('open')
-                    resolve ()
+                    resolve(undefined)
                 })
             })
 
@@ -285,7 +285,7 @@ describe ('Reconnects', () => {
 })
 
 describe ('Pending Requests', () => {
-    it ('should correctly send updates', async () => {
+    it ('should correctly send updates for chats', async () => {
         const conn = makeConnection ()
         conn.pendingRequestTimeoutMs = null
         conn.loadAuthInfo('./auth_info.json')
@@ -312,6 +312,42 @@ describe ('Pending Requests', () => {
         assert.ok ('archive' in chat)
         assert.strictEqual (Object.keys(chat).length, 3)
         assert.strictEqual (Object.keys(chats).length, 1)
+
+        conn.close ()
+    })
+    it ('should correctly send updates for contacts', async () => {
+        const conn = makeConnection ()
+        conn.pendingRequestTimeoutMs = null
+        conn.loadAuthInfo('./auth_info.json')
+
+        const task: any = new Promise(resolve => conn.once('contacts-received', resolve))
+        await conn.connect ()
+        const initialResult = await task
+        assert.strictEqual(
+            initialResult.updatedContacts.length,
+            Object.keys(conn.contacts).length
+        )
+
+
+        conn.close ()
+
+        const [jid] = Object.keys(conn.contacts)
+        const oldContact = conn.contacts[jid]
+        oldContact.name = 'Lol'
+        oldContact.index = 'L'
+
+        const promise = new Promise(resolve => conn.once('contacts-received', resolve))
+
+        const result = await conn.connect ()
+        assert.ok (!result.newConnection)
+
+        const {updatedContacts} = await promise as { updatedContacts: Partial<WAContact>[] }
+        const contact = updatedContacts.find (c => c.jid === jid)
+        assert.ok (contact)
+        
+        assert.ok ('name' in contact)
+        assert.strictEqual (Object.keys(contact).length, 3)
+        assert.strictEqual (Object.keys(updatedContacts).length, 1)
 
         conn.close ()
     })
