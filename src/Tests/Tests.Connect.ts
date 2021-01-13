@@ -1,5 +1,5 @@
 import * as assert from 'assert'
-import {WAConnection} from '../WAConnection/WAConnection'
+import {WAConnection} from '../WAConnection'
 import { AuthenticationCredentialsBase64, BaileysError, ReconnectMode, DisconnectReason, WAChat, WAContact } from '../WAConnection/Constants'
 import { delay } from '../WAConnection/Utils'
 import { assertChatDBIntegrity, makeConnection, testJid } from './Common'
@@ -372,4 +372,36 @@ describe ('Pending Requests', () => {
 
           conn.close ()
     })
+    it('[MANUAL] should receive query response after phone disconnect', async () => {
+        const conn = makeConnection ()
+        await conn.loadAuthInfo('./auth_info.json').connect ()
+
+        console.log(`disconnect your phone from the internet!`)
+        await delay(5000)
+        const task = conn.loadMessages(testJid, 50)
+        setTimeout(() => console.log('reconnect your phone!'), 20_000)
+
+        const result = await task
+        assert.ok(result.messages[0])
+        assert.ok(!conn['phoneCheckInterval']) // should be undefined
+
+        conn.close ()
+    })
+    it('should re-execute query on connection closed error', async () => {
+        const conn = makeConnection ()
+        //conn.pendingRequestTimeoutMs = 10_000
+        await conn.loadAuthInfo('./auth_info.json').connect ()
+        const task: Promise<any> = conn.query({json: ['query', 'Status', conn.user.jid], waitForOpen: true})
+        
+        await delay(20)
+        conn['onMessageRecieved']('1234,["Pong",false]') // fake cancel the connection
+
+        await delay(2000)
+
+        const json = await task
+        
+        assert.ok (json.status)
+
+        conn.close ()
+  })
 })

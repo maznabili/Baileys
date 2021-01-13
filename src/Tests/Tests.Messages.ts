@@ -1,7 +1,8 @@
-import { MessageType, Mimetype, delay, promiseTimeout, WA_MESSAGE_STATUS_TYPE, WAMessageStatusUpdate } from '../WAConnection/WAConnection'
-import {promises as fs} from 'fs'
+import { MessageType, Mimetype, delay, promiseTimeout, WA_MESSAGE_STATUS_TYPE, generateMessageID, WAMessage } from '../WAConnection'
+import { promises as fs } from 'fs'
 import * as assert from 'assert'
-import { WAConnectionTest, testJid, sendAndRetreiveMessage, assertChatDBIntegrity } from './Common'
+import { WAConnectionTest, testJid, sendAndRetreiveMessage } from './Common'
+import { resolve } from 'path'
 
 WAConnectionTest('Messages', conn => {
 
@@ -12,9 +13,11 @@ WAConnectionTest('Messages', conn => {
     it('should send a pending message', async () => {
         const message = await sendAndRetreiveMessage(conn, 'hello fren', MessageType.text, { waitForAck: false })
 
-        await new Promise(resolve => conn.once('message-status-update', update => {
-            if (update.ids.includes(message.key.id)) {
-                assert.strictEqual(update.type, WA_MESSAGE_STATUS_TYPE.SERVER_ACK)
+        await new Promise(resolve => conn.on('chat-update', update => {
+            if (update.jid === testJid && 
+                update.messages && 
+                update.messages.first.key.id === message.key.id &&
+                update.messages.first.status === WA_MESSAGE_STATUS_TYPE.SERVER_ACK) {
                 resolve(undefined)
             } 
         }))
@@ -59,8 +62,7 @@ WAConnectionTest('Messages', conn => {
         }
     })
     it('should send a gif', async () => {
-        const content = await fs.readFile('./Media/ma_gif.mp4')
-        const message = await sendAndRetreiveMessage(conn, content, MessageType.video, { mimetype: Mimetype.gif })
+        const message = await sendAndRetreiveMessage(conn, { url: './Media/ma_gif.mp4' }, MessageType.video, { mimetype: Mimetype.gif })
         
         await conn.downloadAndSaveMediaMessage(message,'./Media/received_vid')
     })
@@ -79,9 +81,18 @@ WAConnectionTest('Messages', conn => {
         assert.strictEqual (message.message?.audioMessage?.ptt, true)
         await conn.downloadAndSaveMediaMessage(message,'./Media/received_aud')
     })
-    it('should send an image', async () => {
-        const content = await fs.readFile('./Media/meme.jpeg')
-        const message = await sendAndRetreiveMessage(conn, content, MessageType.image)
+    it('should send a jpeg image', async () => {
+        const message = await sendAndRetreiveMessage(conn, { url: './Media/meme.jpeg' }, MessageType.image)
+        assert.ok (message.message?.imageMessage?.jpegThumbnail)
+        const msg = await conn.downloadMediaMessage(message)
+        assert.deepStrictEqual(msg, await fs.readFile('./Media/meme.jpeg'))
+    })
+    it('should send a remote jpeg image', async () => {
+        const message = await sendAndRetreiveMessage(
+            conn, 
+            { url: 'https://www.memestemplates.com/wp-content/uploads/2020/05/tom-with-phone.jpg' }, 
+            MessageType.image
+        )
         assert.ok (message.message?.imageMessage?.jpegThumbnail)
         await conn.downloadMediaMessage(message)
     })
@@ -168,17 +179,23 @@ WAConnectionTest('Messages', conn => {
         const content2 = await fs.readFile('./Media/cat.jpeg')
         await sendAndRetreiveMessage(conn, content2, MessageType.image)
     })
-    it('should fail to send a text message', done => {
+    it('should fail to send a text message', async () => {
         const JID = '1234-1234@g.us'
-        conn.sendMessage(JID, 'hello', MessageType.text)
+        const messageId = generateMessageID()
+        conn.sendMessage(JID, 'hello', MessageType.text, { messageId })
 
-        conn.on ('message-status-update', async update => {
-            if (update.to === JID) {
-                assert.strictEqual (update.type, WA_MESSAGE_STATUS_TYPE.ERROR)
-                await conn.deleteChat (JID)
-                done ()
-            }
-        })
+        await new Promise(resolve => (
+            conn.on ('chat-update', async update => {
+                console.log(messageId, update.messages?.first)
+                if (
+                    update.jid === JID && 
+                    update.messages?.first.key.id === messageId &&
+                    update.messages.first.status === WA_MESSAGE_STATUS_TYPE.ERROR) {
+                    resolve(undefined)
+                }
+            })
+        ))
+        conn.removeAllListeners('chat-update')
     })
     it('should maintain message integrity', async () => {
         // loading twice does not alter the results
@@ -236,16 +253,17 @@ WAConnectionTest('Messages', conn => {
         }
     })
     it('should deliver a message', async () => {
+        const response = await conn.sendMessage(testJid, 'My Name Jeff', MessageType.text)
         const waitForUpdate = 
             promiseTimeout(15000, resolve => {
-                conn.on('message-status-update', update => {
-                    if (update.ids.includes(response.key.id)) {
-                        resolve(update)
+                conn.on('chat-update', update => {
+                    if (update.messages?.first.key.id === response.key.id) {
+                        resolve(update.messages.first)
                     }
                 })
-            }) as Promise<WAMessageStatusUpdate>
-        const response = await conn.sendMessage(testJid, 'My Name Jeff', MessageType.text)
+            }) as Promise<WAMessage>
+        
         const m = await waitForUpdate
-        assert.ok (m.type >= WA_MESSAGE_STATUS_TYPE.DELIVERY_ACK)
+        assert.ok (m.status >= WA_MESSAGE_STATUS_TYPE.DELIVERY_ACK)
     })
 })

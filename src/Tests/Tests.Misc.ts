@@ -1,8 +1,8 @@
-import { Presence, ChatModification, delay, newMessagesDB, WA_DEFAULT_EPHEMERAL, MessageType } from '../WAConnection/WAConnection'
+import { Presence, ChatModification, delay, newMessagesDB, WA_DEFAULT_EPHEMERAL, MessageType, WAMessage } from '../WAConnection'
 import { promises as fs } from 'fs'
 import * as assert from 'assert'
-import fetch from 'node-fetch'
-import { WAConnectionTest, testJid, assertChatDBIntegrity, sendAndRetreiveMessage } from './Common'
+import got from 'got'
+import { WAConnectionTest, testJid, sendAndRetreiveMessage } from './Common'
 
 WAConnectionTest('Misc', conn => {
 
@@ -21,10 +21,10 @@ WAConnectionTest('Misc', conn => {
         const newStatus = 'v cool status'
 
         const waitForEvent = new Promise (resolve => {
-            conn.on ('user-status-update', ({jid, status}) => {
+            conn.on ('contact-update', ({jid, status}) => {
                 if (jid === conn.user.jid) {
                     assert.strictEqual (status, newStatus)
-                    conn.removeAllListeners ('user-status-update')
+                    conn.removeAllListeners ('contact-update')
                     resolve(undefined)
                 }
             })
@@ -45,6 +45,33 @@ WAConnectionTest('Misc', conn => {
 
         await conn.setStatus (response.status) // update back
     })
+    it('should update profile name', async () => {
+        const newName = 'v cool name'
+
+        await delay (1000)
+
+        const originalName = conn.user.name!
+
+        const waitForEvent = new Promise<void> (resolve => {
+            conn.on ('contact-update', ({name}) => {
+                assert.strictEqual (name, newName)
+                conn.removeAllListeners ('contact-update')
+                resolve ()
+            })
+        })
+
+        await conn.updateProfileName (newName)
+
+        await waitForEvent
+
+        await delay (1000)
+
+        assert.strictEqual (conn.user.name, newName)
+
+        await delay (1000)
+
+        await conn.updateProfileName (originalName) // update back
+    })
     it('should return the stories', async () => {
         await conn.getStories()
     })
@@ -52,15 +79,14 @@ WAConnectionTest('Misc', conn => {
         await delay (5000)
 
         const ppUrl = await conn.getProfilePicture(conn.user.jid)
-        const fetched = await fetch(ppUrl)
-        const buff = await fetched.buffer ()
+        const {rawBody: oldPP} = await got(ppUrl)
 
-        const newPP = await fs.readFile ('./Media/cat.jpeg')
-        const response = await conn.updateProfilePicture (conn.user.jid, newPP)
+        const newPP = await fs.readFile('./Media/cat.jpeg')
+        await conn.updateProfilePicture(conn.user.jid, newPP)
 
         await delay (10000)
 
-        await conn.updateProfilePicture (conn.user.jid, buff) // revert back
+        await conn.updateProfilePicture (conn.user.jid, oldPP) // revert back
     })
     it('should return the profile picture', async () => {
         const response = await conn.getProfilePicture(testJid)
@@ -92,9 +118,37 @@ WAConnectionTest('Misc', conn => {
         }
     })
     it('should archive & unarchive', async () => {
+        // wait for chats
+        await new Promise(resolve => (
+            conn.once('chats-received', ({ }) => resolve(undefined))
+        ))
+
+        const idx = conn.chats.all().findIndex(chat => chat.jid === testJid)
         await conn.modifyChat (testJid, ChatModification.archive)
+        const idx2 = conn.chats.all().findIndex(chat => chat.jid === testJid)
+        assert.ok(idx < idx2) // should move further down the array
+
         await delay (2000)
         await conn.modifyChat (testJid, ChatModification.unarchive)
+        const idx3 = conn.chats.all().findIndex(chat => chat.jid === testJid)
+        assert.strictEqual(idx, idx3) // should be back there
+    })
+    it('should archive & unarchive on new message', async () => {
+        // wait for chats
+        await new Promise(resolve => (
+            conn.once('chats-received', ({ }) => resolve(undefined))
+        ))
+
+        const idx = conn.chats.all().findIndex(chat => chat.jid === testJid)
+        await conn.modifyChat (testJid, ChatModification.archive)
+        const idx2 = conn.chats.all().findIndex(chat => chat.jid === testJid)
+        assert.ok(idx < idx2) // should move further down the array
+
+        await delay (2000)
+        await sendAndRetreiveMessage(conn, 'test', MessageType.text)
+        // should be unarchived
+        const idx3 = conn.chats.all().findIndex(chat => chat.jid === testJid)
+        assert.strictEqual(idx, idx3) // should be back there
     })
     it('should pin & unpin a chat', async () => {
         await conn.modifyChat (testJid, ChatModification.pin)
@@ -116,7 +170,7 @@ WAConnectionTest('Misc', conn => {
         await delay (2000)
         await conn.modifyChat (testJid, ChatModification.unmute)
     })
-    it('should star/unchar messages', async () => {
+    it('should star/unstar messages', async () => {
         for (let i = 1; i <= 5; i++) {
           await conn.sendMessage(testJid, `Message ${i}`, MessageType.text)
           await delay(1000)
@@ -221,7 +275,7 @@ WAConnectionTest('Misc', conn => {
     it('should detect overlaps and clear messages accordingly', async () => {
         // wait for chats
         await new Promise(resolve => (
-            conn.once('chats-received', ({ hasReceivedLastMessage }) => hasReceivedLastMessage && resolve(undefined))
+            conn.once('initial-data-received', resolve)
         ))
 
         conn.maxCachedMessages = 100
@@ -238,18 +292,16 @@ WAConnectionTest('Misc', conn => {
         chat.messages = newMessagesDB( chat.messages.all().slice(0, 20) )
 
         const task = new Promise(resolve => (
-            conn.on('chats-received', ({ hasReceivedLastMessage, chatsWithMissingMessages }) => {
-                if (hasReceivedLastMessage) {
-                    assert.strictEqual(Object.keys(chatsWithMissingMessages).length, 1)
-                    const missing = chatsWithMissingMessages.find(({ jid }) => jid === testJid)
-                    assert.ok(missing, 'missing message not detected')
-                    assert.strictEqual(
-                        conn.chats.get(testJid).messages.length,
-                        missing.count
-                    )
-                    assert.strictEqual(missing.count, oldCount)
-                    resolve(undefined)
-                }
+            conn.on('initial-data-received', ({ chatsWithMissingMessages }) => {
+                assert.strictEqual(Object.keys(chatsWithMissingMessages).length, 1)
+                const missing = chatsWithMissingMessages.find(({ jid }) => jid === testJid)
+                assert.ok(missing, 'missing message not detected')
+                assert.strictEqual(
+                    conn.chats.get(testJid).messages.length,
+                    missing.count
+                )
+                assert.strictEqual(missing.count, oldCount)
+                resolve(undefined)
             })
         ))
 
@@ -343,5 +395,21 @@ WAConnectionTest('Misc', conn => {
         await conn.blockUser (testJid, 'remove')
         assert.strictEqual(conn.blocklist.length, blockedCount);
         await waitForEventRemoved
+    })
+    it('should exit an invalid query', async () => {
+        // try and send an already sent message
+        let msg: WAMessage
+        await conn.findMessage(testJid, 5, m => {
+            if(m.key.fromMe) {
+                msg = m
+                return true
+            }
+        })
+        try {
+            await conn.relayWAMessage(msg)
+            assert.fail('should not have sent')
+        } catch(error) {
+            assert.strictEqual(error.status, 422)
+        }
     })
 })
