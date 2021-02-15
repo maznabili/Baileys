@@ -32,7 +32,7 @@ const logger = pino({ prettyPrint: { levelFirst: true, ignore: 'hostname', trans
 
 export class WAConnection extends EventEmitter {
     /** The version of WhatsApp Web we're telling the servers we are */
-    version: [number, number, number] = [2, 2047, 10]
+    version: [number, number, number] = [2, 2102, 9]
     /** The Browser we're telling the WhatsApp Web servers we are */
     browserDescription: [string, string, string] = Utils.Browsers.baileys ('Chrome')
     /** Metadata like WhatsApp id, name set on WhatsApp etc. */
@@ -46,7 +46,8 @@ export class WAConnection extends EventEmitter {
         maxRetries: 10,
         connectCooldownMs: 4000,
         phoneResponseTime: 15_000,
-        alwaysUseTakeover: true
+        alwaysUseTakeover: true,
+        queryChatsTillReceived: true
     }
     /** When to auto-reconnect */
     autoReconnect = ReconnectMode.onConnectionLost 
@@ -62,28 +63,23 @@ export class WAConnection extends EventEmitter {
     messageLog: { tag: string, json: string, fromMe: boolean, binaryTags?: any[] }[] = []
 
     maxCachedMessages = 50
-    /** 
-     * @deprecated 
-     * does not do anything
-     * */
-    loadProfilePicturesForChatsAutomatically = false
 
     lastChatsReceived: Date
     chats = new KeyedDB (Utils.waChatKey(false), value => value.jid)
     contacts: { [k: string]: WAContact } = {}
-    blocklist: string[] = [];
+    blocklist: string[] = []
 
     /** Data structure of tokens & IDs used to establish one's identiy to WhatsApp Web */
-    protected authInfo: AuthenticationCredentials = null
+    protected authInfo: AuthenticationCredentials
     /** Curve keys to initially authenticate */
     protected curveKeys: { private: Uint8Array; public: Uint8Array }
     /** The websocket connection */
-    protected conn: WS = null
+    protected conn: WS
     protected msgCount = 0
     protected keepAliveReq: NodeJS.Timeout
     protected encoder = new Encoder()
     protected decoder = new Decoder()
-    protected phoneCheckInterval = undefined
+    protected phoneCheckInterval
     protected phoneCheckListeners = 0
 
     protected referenceDate = new Date () // used for generating tags
@@ -94,8 +90,12 @@ export class WAConnection extends EventEmitter {
     protected lastDisconnectReason: DisconnectReason 
 
     protected mediaConn: MediaConnInfo
-    protected debounceTimeout: NodeJS.Timeout
-
+    protected connectionDebounceTimeout = Utils.debouncedTimeout(
+        1000, 
+        () => this.state === 'connecting' && this.endConnection(DisconnectReason.timedOut)
+    )
+    protected messagesDebounceTimeout = Utils.debouncedTimeout(2000)
+    protected chatsDebounceTimeout = Utils.debouncedTimeout(10_000)
     /**
      * Connect to WhatsAppWeb
      * @param options the connect options
@@ -223,17 +223,17 @@ export class WAConnection extends EventEmitter {
         requiresPhoneConnection = requiresPhoneConnection !== false
         waitForOpen = waitForOpen !== false
         let triesLeft = maxRetries || 2
-        tag = tag || this.generateMessageTag (longTag)
-
+        tag = tag || this.generateMessageTag(longTag)
+        
         while (triesLeft >= 0) {
             if (waitForOpen) await this.waitForConnection()
-            
+
             const promise = this.waitForMessage(tag, requiresPhoneConnection, timeoutMs)
 
             if (this.logger.level === 'trace') {
                 this.logger.trace ({ fromMe: true },`${tag},${JSON.stringify(json)}`)
             }
-
+           
             if (binaryTags) tag = await this.sendBinary(json as WANode, binaryTags, tag)
             else tag = await this.sendJSON(json, tag)
 
@@ -247,7 +247,7 @@ export class WAConnection extends EventEmitter {
                     )
                 }
                 if (startDebouncedTimeout) {
-                    this.startDebouncedTimeout()
+                    this.connectionDebounceTimeout.start()
                 }
                 return response
             } catch (error) {
@@ -344,17 +344,6 @@ export class WAConnection extends EventEmitter {
         await this.send(buff) // send it off
         return tag
     }
-    protected startDebouncedTimeout () {
-        this.stopDebouncedTimeout ()
-        this.debounceTimeout = setTimeout (
-            () => this.endConnection(DisconnectReason.timedOut), 
-            this.connectOptions.maxIdleTimeMs
-        )
-    }
-    protected stopDebouncedTimeout ()  {
-        this.debounceTimeout && clearTimeout (this.debounceTimeout)
-        this.debounceTimeout = null
-    }
     /**
      * Send a plain JSON message to the WhatsApp servers
      * @param json the message to send
@@ -369,7 +358,6 @@ export class WAConnection extends EventEmitter {
     }
     /** Send some message to the WhatsApp servers */
     protected async send(m) {
-        this.msgCount += 1 // increment message count, it makes the 'epoch' field when sending binary messages
         this.conn.send(m)
     }
     protected async waitForConnection () {
@@ -439,7 +427,9 @@ export class WAConnection extends EventEmitter {
         this.conn?.removeAllListeners ('message')
 
         this.initTimeout && clearTimeout (this.initTimeout)
-        this.debounceTimeout && clearTimeout (this.debounceTimeout)
+        this.connectionDebounceTimeout.cancel()
+        this.messagesDebounceTimeout.cancel()
+        this.chatsDebounceTimeout.cancel()
         this.keepAliveReq && clearInterval(this.keepAliveReq)
         this.phoneCheckListeners = 0
         this.clearPhoneCheckInterval ()
@@ -477,6 +467,8 @@ export class WAConnection extends EventEmitter {
     )
     generateMessageTag (longTag: boolean = false) {
         const seconds = Utils.unixTimestampSeconds(this.referenceDate)
-        return `${longTag ? seconds : (seconds%1000)}.--${this.msgCount}`
+        const tag = `${longTag ? seconds : (seconds%1000)}.--${this.msgCount}`
+        this.msgCount += 1 // increment message count, it makes the 'epoch' field when sending binary messages
+        return tag
     }
 }

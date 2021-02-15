@@ -15,7 +15,7 @@ import * as fs from 'fs'
 async function example() {
     const conn = new WAConnection() // instantiate
     conn.autoReconnect = ReconnectMode.onConnectionLost // only automatically reconnect when the connection breaks
-    conn.logger.level = 'trace' // set to 'debug' to see what kind of stuff you can implement
+    conn.logger.level = 'debug' // set to 'debug' to see what kind of stuff you can implement
     // attempt to reconnect at most 10 times in a row
     conn.connectOptions.maxRetries = 10
     conn.chatOrderingKey = waChatKey(true) // order chats such that pinned chats are on top
@@ -24,6 +24,9 @@ async function example() {
     })
     conn.on('contacts-received', () => {
         console.log(`you have ${Object.keys(conn.contacts).length} contacts`)
+    })
+    conn.on('initial-data-received', () => {
+        console.log('received all initial messages')
     })
 
     // loads the auth file credentials if present
@@ -38,7 +41,6 @@ async function example() {
     fs.writeFileSync('./auth_info.json', JSON.stringify(authInfo, null, '\t')) // save this info to a file
 
     console.log('oh hello ' + conn.user.name + ' (' + conn.user.jid + ')')    
-
     // uncomment to load all unread messages
     //const unread = await conn.loadAllUnreadMessages ()
     //console.log ('you have ' + unread.length + ' unread messages')

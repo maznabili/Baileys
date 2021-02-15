@@ -26,6 +26,8 @@ export class WAConnection extends Base {
         // chats received
         this.on('CB:response,type:chat', json => {
             if (json[1].duplicate || !json[2]) return
+            
+            this.chatsDebounceTimeout.cancel()
             const chats = new KeyedDB(this.chatOrderingKey, c => c.jid)
 
             json[2].forEach(([item, chat]: [any, WAChat]) => {
@@ -77,12 +79,31 @@ export class WAConnection extends Base {
         // if there are no overlaps of messages and we had messages present, we clear the previous messages
         // this prevents missing messages in conversations
         let overlaps: { [_: string]: { requiresOverlap: boolean, didOverlap?: boolean } } = {}
+        const onLastBatchOfDataReceived = () => {
+            // find which chats had missing messages
+            // list out all the jids, and how many messages we've cached now
+            const chatsWithMissingMessages = Object.keys(overlaps).map(jid => {
+                // if there was no overlap, delete previous messages
+                if (!overlaps[jid].didOverlap && overlaps[jid].requiresOverlap) {
+                    this.logger.debug(`received messages for ${jid}, but did not overlap with previous messages, clearing...`)
+                    const chat = this.chats.get(jid)
+                    if (chat) {
+                        const message = chat.messages.get(lastMessages[jid])
+                        const remainingMessages = chat.messages.paginatedByValue(message, this.maxCachedMessages, undefined, 'after')
+                        chat.messages = newMessagesDB([message, ...remainingMessages])
+                        return { jid, count: chat.messages.length } // return number of messages we've left
+                    }
+                }
+            }).filter(Boolean)
+            this.emit('initial-data-received', { chatsWithMissingMessages })
+        }
         // messages received
         const messagesUpdate = (json, style: 'previous' | 'last') => {
+            //console.log('msg ', json[1])
+            this.messagesDebounceTimeout.start(undefined, onLastBatchOfDataReceived)
             if (style === 'last') {
                 overlaps = {}
             }
-            const isLast = json[1].last
             const messages = json[2] as WANode[]
             if (messages) {
                 const updates: { [k: string]: KeyedDB<WAMessage, string> } = {}
@@ -120,24 +141,6 @@ export class WAConnection extends Base {
                         Object.keys(updates).map(jid => ({ jid, messages: updates[jid] }))
                     )
                 }
-            }
-            if (isLast) {
-                // find which chats had missing messages
-                // list out all the jids, and how many messages we've cached now
-                const chatsWithMissingMessages = Object.keys(overlaps).map(jid => {
-                    // if there was no overlap, delete previous messages
-                    if (!overlaps[jid].didOverlap && overlaps[jid].requiresOverlap) {
-                        this.logger.debug(`received messages for ${jid}, but did not overlap with previous messages, clearing...`)
-                        const chat = this.chats.get(jid)
-                        if (chat) {
-                            const message = chat.messages.get(lastMessages[jid])
-                            const remainingMessages = chat.messages.paginatedByValue(message, this.maxCachedMessages, undefined, 'after')
-                            chat.messages = newMessagesDB([message, ...remainingMessages])
-                            return { jid, count: chat.messages.length } // return number of messages we've left
-                        }
-                    }
-                }).filter(Boolean)
-                this.emit('initial-data-received', { chatsWithMissingMessages })
             }
         }
         this.on('CB:action,add:last', json =>  messagesUpdate(json, 'last'))
@@ -235,29 +238,31 @@ export class WAConnection extends Base {
                 this.logger.debug ({ unhandled: true }, 'received message update for non-present message from ' + jid)
             }
         })
-        this.on('CB:action,add:relay,received', json => {
+        // message status updates
+        const onMessageStatusUpdate = json => {
             json = json[2][0][1]
-            const chat = this.chats.get( whatsappID(json.jid) )
-            const msg = chat?.messages.get(GET_MESSAGE_ID({ id: json.index, fromMe: json.owner === 'true' }))
-            if (msg) {
-                const MAP = {
-                    read: WA_MESSAGE_STATUS_TYPE.READ,
-                    message: WA_MESSAGE_STATUS_TYPE.DELIVERY_ACK,
-                    error: WA_MESSAGE_STATUS_TYPE.ERROR
-                }
-                const status = MAP[json.type]
-                if (typeof status !== 'undefined') {
-                    if (status > msg.status || status === WA_MESSAGE_STATUS_TYPE.ERROR) {
-                        msg.status = status
-                        this.emit('chat-update', { jid: chat.jid, messages: newMessagesDB([ msg ]) })
-                    }
-                } else {
-                    this.logger.warn({ update: json }, 'received unknown message status update')
-                }
-            } else {
-                this.logger.debug ({ unhandled: true, update: json }, 'received message status update for non-present message')
+            const MAP = {
+                read: WA_MESSAGE_STATUS_TYPE.READ,
+                message: WA_MESSAGE_STATUS_TYPE.DELIVERY_ACK,
+                error: WA_MESSAGE_STATUS_TYPE.ERROR
             }
-        })
+            this.onMessageStatusUpdate(
+                whatsappID(json.jid),
+                { id: json.index, fromMe: json.owner === 'true' },
+                MAP[json.type]
+            )
+        }
+        this.on('CB:action,add:relay,received', onMessageStatusUpdate)
+        this.on('CB:action,,received', onMessageStatusUpdate)
+
+        this.on('CB:Msg,cmd:ack', json => (
+            this.onMessageStatusUpdate(
+                whatsappID(json[1].to),
+                { id: json[1].id, fromMe: true },
+                +json[1].ack + 1
+            )
+        ))
+
         // If a user's contact has changed
         this.on ('CB:action,,user', json => {
             const node = json[2][0]
@@ -428,6 +433,22 @@ export class WAConnection extends Base {
             this.emit ('chat-new', chat)
             return chat
         }   
+    }
+    protected onMessageStatusUpdate(jid: string, key: { id: string, fromMe: boolean }, status: WA_MESSAGE_STATUS_TYPE) {
+        const chat = this.chats.get( whatsappID(jid) )
+        const msg = chat?.messages.get(GET_MESSAGE_ID(key))
+        if (msg) {
+            if (typeof status !== 'undefined') {
+                if (status > msg.status || status === WA_MESSAGE_STATUS_TYPE.ERROR) {
+                    msg.status = status
+                    this.emit('chat-update', { jid: chat.jid, messages: newMessagesDB([ msg ]) })
+                }
+            } else {
+                this.logger.warn({ update: status }, 'received unknown message status update')
+            }
+        } else {
+            this.logger.debug ({ unhandled: true, update: status, key }, 'received message status update for non-present message')
+        }
     }
     protected contactAddOrGet (jid: string) {
         jid = whatsappID(jid)

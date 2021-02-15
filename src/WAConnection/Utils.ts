@@ -15,7 +15,6 @@ import got, { Options, Response } from 'got'
 import { join } from 'path'
 import { IAudioMetadata } from 'music-metadata'
 
-
 const platformMap = {
     'aix': 'AIX',
     'darwin': 'Mac OS',
@@ -104,6 +103,25 @@ export function randomBytes(length) {
 }
 /** unix timestamp of a date in seconds */
 export const unixTimestampSeconds = (date: Date = new Date()) => Math.floor(date.getTime()/1000)
+
+export type DebouncedTimeout = ReturnType<typeof debouncedTimeout>
+export const debouncedTimeout = (intervalMs: number = 1000, task: () => void = undefined) => {
+    let timeout: NodeJS.Timeout
+    return {
+        start: (newIntervalMs?: number, newTask?: () => void) => {
+            task = newTask || task
+            intervalMs = newIntervalMs || intervalMs
+            timeout && clearTimeout(timeout)
+            timeout = setTimeout(task, intervalMs)
+        },
+        cancel: () => {
+            timeout && clearTimeout(timeout)
+            timeout = undefined
+        },
+        setTask: (newTask: () => void) => task = newTask,
+        setInterval: (newInterval: number) => intervalMs = newInterval
+    }
+}
 
 export const delay = (ms: number) => delayCancellable (ms).delay
 export const delayCancellable = (ms: number) => {
@@ -294,8 +312,9 @@ export async function generateThumbnail(file: string, mediaType: MessageType, in
     }
 }
 export const getGotStream = async(url: string | URL, options: Options & { isStream?: true } = {}) => {
-    const fetched = got.stream(url, options)
+    const fetched = got.stream(url, { ...options, isStream: true })
     await new Promise((resolve, reject) => {
+        fetched.once('error', reject)
         fetched.once('response', ({statusCode: status}: Response) => {
             if (status >= 400) {
                 reject(new BaileysError (
@@ -309,7 +328,7 @@ export const getGotStream = async(url: string | URL, options: Options & { isStre
     })
     return fetched
 } 
-export const encryptedStream = async(media: WAMediaUpload, mediaType: MessageType) => {
+export const encryptedStream = async(media: WAMediaUpload, mediaType: MessageType, saveOriginalFileIfRequired = true) => {
     const { stream, type } = await getStream(media)
 
     const mediaKey = randomBytes(32)
@@ -321,7 +340,7 @@ export const encryptedStream = async(media: WAMediaUpload, mediaType: MessageTyp
     let writeStream: WriteStream
     if(type === 'file') {
         bodyPath = (media as any).url
-    } else {
+    } else if(saveOriginalFileIfRequired) {
         bodyPath = join(tmpdir(), mediaType + generateMessageID())
         writeStream = createWriteStream(bodyPath)
     }
