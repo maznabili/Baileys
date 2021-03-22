@@ -1,7 +1,7 @@
 import * as QR from 'qrcode-terminal'
 import { WAConnection as Base } from './3.Connect'
-import { WAMessageStatusUpdate, WAMessage, WAContact, WAChat, WAMessageProto, WA_MESSAGE_STUB_TYPE, WA_MESSAGE_STATUS_TYPE, PresenceUpdate, BaileysEvent, DisconnectReason, WAOpenResult, Presence, AuthenticationCredentials, WAParticipantAction, WAGroupMetadata, WAUser, WANode, WAPresenceData, WAChatUpdate, BlocklistUpdate, WAContactUpdate, WAMetric, WAFlag } from './Constants'
-import { whatsappID, unixTimestampSeconds, isGroupID, GET_MESSAGE_ID, WA_MESSAGE_ID, waMessageKey, newMessagesDB, shallowChanges, toNumber } from './Utils'
+import { WAMessage, WAContact, WAChat, WAMessageProto, WA_MESSAGE_STUB_TYPE, WA_MESSAGE_STATUS_TYPE, PresenceUpdate, BaileysEvent, DisconnectReason, WAOpenResult, Presence, AuthenticationCredentials, WAParticipantAction, WAGroupMetadata, WAUser, WANode, WAPresenceData, WAChatUpdate, BlocklistUpdate, WAContactUpdate, WAMetric, WAFlag } from './Constants'
+import { whatsappID, unixTimestampSeconds, GET_MESSAGE_ID, WA_MESSAGE_ID, waMessageKey, newMessagesDB, shallowChanges, toNumber } from './Utils'
 import KeyedDB from '@adiwajshing/keyed-db'
 import { Mutex } from './Mutex'
 
@@ -254,8 +254,6 @@ export class WAConnection extends Base {
                 if (chat.messages.upsert(message).length) {
                     const chatUpdate: Partial<WAChat> = { jid, messages: newMessagesDB([ message ]) }
                     this.emit ('chat-update', chatUpdate)
-                    // emit deprecated
-                    this.emit ('message-update', message)
                 }
             } else {
                 this.logger.debug ({ unhandled: true }, 'received message update for non-present message from ' + jid)
@@ -316,7 +314,7 @@ export class WAConnection extends Base {
             const FUNCTIONS = {
                 'delete': () => {
                     chat['delete'] = 'true'
-                    this.chats.delete(chat)
+                    this.chats.deleteById(chat.jid)
                     return 'delete'
                 },
                 'clear': () => {
@@ -578,6 +576,18 @@ export class WAConnection extends Base {
                 const emitGroupUpdate = (update: Partial<WAGroupMetadata>) => this.emitGroupUpdate(jid, update)
                 
                 switch (message.messageStubType) {
+                    case WA_MESSAGE_STUB_TYPE.CHANGE_EPHEMERAL_SETTING:
+                        chatUpdate.eph_setting_ts = message.messageTimestamp.toString()
+                        chatUpdate.ephemeral = message.messageStubParameters[0]
+                        
+                        if (+chatUpdate.ephemeral) {
+                            chat.eph_setting_ts = chatUpdate.eph_setting_ts
+                            chat.ephemeral = chatUpdate.ephemeral
+                        } else {
+                            delete chat.eph_setting_ts
+                            delete chat.ephemeral
+                        }
+                        break
                     case WA_MESSAGE_STUB_TYPE.GROUP_PARTICIPANT_LEAVE:
                     case WA_MESSAGE_STUB_TYPE.GROUP_PARTICIPANT_REMOVE:
                         participants = message.messageStubParameters.map (whatsappID)

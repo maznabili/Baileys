@@ -317,8 +317,6 @@ export class WAConnection extends Base {
 
                 const chatUpdate: Partial<WAChat> = { jid: messageKey.remoteJid, messages: newMessagesDB([ message ]) }
                 this.emit ('chat-update', chatUpdate)
-                // emit deprecated
-                this.emit ('message-update', message)
             }
         }
         return result
@@ -377,13 +375,6 @@ export class WAConnection extends Base {
         const waMessage = this.prepareMessageFromContent (jid, content, {})
         await this.relayWAMessage (waMessage)
         return waMessage
-    }
-    /** 
-     * Delete the chat of a given ID 
-     * @deprecated -- use `modifyChat(jid, 'delete')` instead
-     * */
-    deleteChat (jid: string) {
-        return this.modifyChat(jid, 'delete')
     }
     /**
      * Clear the chat messages
@@ -447,23 +438,31 @@ export class WAConnection extends Base {
         const response = await this.setQuery ([['chat', chatAttrs, null]], [ WAMetric.chat, WAFlag.ignore ])
 
         if (chat && response.status === 200) {
-            if (type === ChatModification.clear) {
-                if (includeStarred) {
-                    chat.messages.clear ()
-                } else {
-                    chat.messages = chat.messages.filter(m => m.starred)
-                }
+            switch(type) {
+                case ChatModification.clear:
+                    if (includeStarred) {
+                        chat.messages.clear()
+                    } else {
+                        chat.messages = chat.messages.filter(m => m.starred)
+                    }
+                break
+                case ChatModification.delete:
+                    this.chats.deleteById(jid)
+                    this.emit('chat-update', { jid, delete: 'true' })
+                break
+                default:
+                    this.chats.update(jid, chat => {
+                        if (type.includes('un')) {
+                            type = type.replace ('un', '') as ChatModification
+                            delete chat[type.replace('un','')]
+                            this.emit ('chat-update', { jid, [type]: false })
+                        } else {
+                            chat[type] = chatAttrs[type] || 'true'
+                            this.emit ('chat-update', { jid, [type]: chat[type] })
+                        }
+                    })
+                break
             }
-            this.chats.update(jid, chat => {
-                if (type.includes('un')) {
-                    type = type.replace ('un', '') as ChatModification
-                    delete chat[type.replace('un','')]
-                    this.emit ('chat-update', { jid, [type]: false })
-                } else {
-                    chat[type] = chatAttrs[type] || 'true'
-                    this.emit ('chat-update', { jid, [type]: chat[type] })
-                }
-            })
         }
         return response
     }
